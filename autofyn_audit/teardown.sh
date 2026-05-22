@@ -33,6 +33,9 @@ rm -f /tmp/vuln11_pwned 2>/dev/null || true
 rm -rf /tmp/chain1_secrets 2>/dev/null || true
 rm -f /tmp/chain1_exfil_capture.json 2>/dev/null || true
 rm -rf /tmp/chain2_home 2>/dev/null || true
+rm -rf /tmp/chain3_target_secrets 2>/dev/null || true
+rm -rf /tmp/chain3_exfiltrated 2>/dev/null || true
+rm -f /tmp/chain3_shadow_postinstall_ran 2>/dev/null || true
 
 # Clean up verdaccio storage
 rm -rf "$SCRIPT_DIR/.verdaccio" 2>/dev/null || true
