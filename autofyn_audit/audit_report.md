@@ -10,7 +10,7 @@
 
 ## Executive Summary
 
-This audit identified five independently reproducible security vulnerabilities in pnpm v11.2.2. All five vulnerabilities have been confirmed with live proof-of-concept exploit scripts against the source-built binary at commit 976504f.
+This audit identified seven independently reproducible security vulnerabilities in pnpm v11.2.2. All seven vulnerabilities have been confirmed with live proof-of-concept exploit scripts against the source-built binary at commit 976504f.
 
 | ID | Title | Severity | CVSS v3.1 |
 |----|-------|----------|-----------|
@@ -19,8 +19,10 @@ This audit identified five independently reproducible security vulnerabilities i
 | VULN-3 | .npmrc Environment Variable Exfiltration via Scoped Registry | Medium | 5.5 |
 | VULN-4 | Git ext:: Protocol Injection via Lockfile (Conditional RCE) | Medium | 6.4 |
 | VULN-5 | Bin Linking Bypasses allowBuild Security Policy (PATH Hijacking) | Medium | 6.3 |
+| VULN-6 | Arbitrary File Write via Malicious Patch File (Path Traversal) | High | 7.3 |
+| VULN-7 | Arbitrary File Deletion via Malicious Patch File (Path Traversal) | High | 7.3 |
 
-The most severe finding (VULN-1) enables silent supply chain compromise: an attacker who can modify a project's lockfile can cause `pnpm install --frozen-lockfile` to install tampered packages without any integrity error or warning. VULN-4 and VULN-5 further demonstrate that the lockfile and the `allowBuilds` security policy both lack validation that a determined attacker can exploit.
+The most severe finding (VULN-1) enables silent supply chain compromise: an attacker who can modify a project's lockfile can cause `pnpm install --frozen-lockfile` to install tampered packages without any integrity error or warning. VULN-4 and VULN-5 further demonstrate that the lockfile and the `allowBuilds` security policy both lack validation that a determined attacker can exploit. VULN-6 and VULN-7 expose pnpm's patch application pipeline as a path traversal vector: malicious `.patch` files can write to or delete arbitrary files on the filesystem during `pnpm install`.
 
 ---
 
@@ -397,8 +399,141 @@ PATH hijacking from a package that is supposedly blocked by security policy. Use
 
 ---
 
+## VULN-6: Arbitrary File Write via Malicious Patch File (Path Traversal)
+
+**Severity:** High
+**CVSS v3.1 Score:** 7.3 (AV:N/AC:L/PR:L/UI:R/S:U/C:H/I:H/A:N)
+**Proof of Concept:** `exploits/vuln6_patch_traversal_write/exploit.sh`
+
+### Affected Code
+
+| File | Lines | Role |
+|------|-------|------|
+| `patching/apply-patch/node_modules/@pnpm/patch-package/dist/patch/parse.js` | 88 | `diff --git a/(.*?) b/(.*?)` regex extracts paths with no sanitization |
+| `patching/apply-patch/node_modules/@pnpm/patch-package/dist/patch/parse.js` | 129 | `+++ b/` path sliced from line with no sanitization |
+| `patching/apply-patch/node_modules/@pnpm/patch-package/dist/patch/parse.js` | 237-249 | `interpretParsedPatchFile`: file creation uses `diffLineToPath \|\| toPath` as `eff.path` |
+| `patching/apply-patch/node_modules/@pnpm/patch-package/dist/patch/apply.js` | 35-49 | `executeEffects`: `fs.ensureDirSync(dirname(eff.path))` then `fs.writeFileSync(eff.path, ...)` |
+| `patching/apply-patch/src/index.ts` | 12-13 | `process.chdir(opts.patchedDir)` sets CWD to installed package dir before effects execute |
+| `building/during-install/src/index.ts` | 185 | `applyPatchToDir({ patchedDir: depNode.dir, patchFilePath: ... })` triggered during `pnpm install` |
+
+### Description
+
+pnpm's patch application pipeline has zero path validation. During `pnpm install`, when a `patchedDependencies` entry is present in `pnpm-workspace.yaml`, pnpm reads the referenced `.patch` file and applies it via the embedded `@pnpm/patch-package` library. The patch parser extracts file paths from `diff --git a/(.*?) b/(.*?)` headers and `+++ b/PATH` lines using simple string operations with no path traversal checks.
+
+Before executing effects, `applyPatchToDir` sets `process.chdir(patchedDir)` where `patchedDir` is the installed package directory deep inside `node_modules/.pnpm/`. A path containing `../../../../../../../../../../tmp/target` in the patch header traverses out of the package directory to an arbitrary absolute path. The `executeEffects` function for a "file creation" effect then calls `fs.ensureDirSync(dirname(eff.path))` and `fs.writeFileSync(eff.path, fileContents, { mode: eff.mode })` with the unsanitized path, writing attacker-controlled content to any location the process has write access to.
+
+```javascript
+// apply.js:35-49 (vulnerable -- file creation effect)
+case 'file creation': {
+  const eff = effect
+  fs.ensureDirSync(dirname(eff.path))      // creates dirs along traversal path
+  fs.writeFileSync(eff.path, fileContents, { mode: eff.mode })  // writes to arbitrary path
+  break
+}
+```
+
+The `diff --git` header `a/../../../../../../../../../../tmp/vuln6_pwned b/../../../../../../../../../../tmp/vuln6_pwned` combined with `new file mode 100644` triggers the file creation effect. The `interpretParsedPatchFile` function at `parse.js:238` uses `diffLineToPath` (from the `diff --git b/` path) as `eff.path`, resolving to `/tmp/vuln6_pwned` when the process CWD is inside the virtual store.
+
+### Attack Scenario
+
+1. Attacker gains the ability to contribute a `.patch` file to a project (pull request, compromised contributor, compromised CI that writes `pnpm-workspace.yaml`).
+2. Attacker crafts a patch file with a `diff --git` header whose path traverses out of the package directory: `diff --git a/../../../../../../../../../../home/user/.ssh/authorized_keys b/../../../../../../../../../../home/user/.ssh/authorized_keys`.
+3. The patch `patchedDependencies` entry is committed alongside the patch file.
+4. Victim developer or CI pipeline runs `pnpm install`.
+5. pnpm applies the malicious patch and `fs.writeFileSync` writes the attacker's content to `~/.ssh/authorized_keys` (or any other writable path), overwriting the file.
+
+### Proof of Concept
+
+```bash
+# Prerequisites: setup.sh must have been run (verdaccio on localhost:4873)
+bash autofyn_audit/exploits/vuln6_patch_traversal_write/exploit.sh
+# Expected: PASS -- /tmp/vuln6_pwned created with content PWNED_BY_MALICIOUS_PATCH
+```
+
+The exploit publishes a trivial package, runs an initial `pnpm install` to generate a lockfile, then adds a malicious `.patch` file and `pnpm-workspace.yaml` with `patchedDependencies`. After clearing the store and re-running install, `/tmp/vuln6_pwned` is created with attacker-controlled content, demonstrating arbitrary file write outside the package sandbox.
+
+### Impact
+
+Arbitrary file write as the user running `pnpm install`. An attacker can overwrite SSH keys, shell configuration files, CI/CD credentials, system binaries (if running as root), or any other file the process has write access to. Combined with the ability to create directories (`fs.ensureDirSync`), this can establish persistence on developer machines and CI systems. The `--frozen-lockfile` flag provides no protection since the patch file path and `pnpm-workspace.yaml` are separate from the lockfile.
+
+### Remediation
+
+1. **Validate paths after `dirname` resolution:** After parsing patch file paths, resolve them against the package root and reject any path that escapes with `path.resolve` + prefix check: if `!resolvedPath.startsWith(packageRoot)`, throw an error.
+2. **Sanitize at parse time:** In `parse.js`, reject any parsed path that contains `..` components before returning the parsed patch object.
+3. **Sandbox the CWD:** Rather than using `process.chdir`, resolve all effect paths against the package directory before executing effects, keeping the process CWD stable and making traversal attempts explicit.
+4. **Apply a blocklist** to the `patchedDependencies` patch file paths in `pnpm-workspace.yaml` so paths outside the workspace are rejected at config load time.
+
+---
+
+## VULN-7: Arbitrary File Deletion via Malicious Patch File (Path Traversal)
+
+**Severity:** High
+**CVSS v3.1 Score:** 7.3 (AV:N/AC:L/PR:L/UI:R/S:U/C:N/I:H/A:H)
+**Proof of Concept:** `exploits/vuln7_patch_traversal_delete/exploit.sh`
+
+### Affected Code
+
+| File | Lines | Role |
+|------|-------|------|
+| `patching/apply-patch/node_modules/@pnpm/patch-package/dist/patch/parse.js` | 88 | `diff --git a/(.*?) b/(.*?)` regex extracts paths with no sanitization |
+| `patching/apply-patch/node_modules/@pnpm/patch-package/dist/patch/parse.js` | 126 | `--- a/` path sliced from line with no sanitization |
+| `patching/apply-patch/node_modules/@pnpm/patch-package/dist/patch/parse.js` | 223-235 | `interpretParsedPatchFile`: file deletion uses `diffLineFromPath \|\| fromPath` as `eff.path` |
+| `patching/apply-patch/node_modules/@pnpm/patch-package/dist/patch/apply.js` | 13-22 | `executeEffects`: `fs.unlinkSync(eff.path)` with no path validation; `// TODO: integrity checks` comment confirms authors knew validation was absent |
+| `patching/apply-patch/src/index.ts` | 12-13 | `process.chdir(opts.patchedDir)` sets CWD to installed package dir before effects execute |
+| `building/during-install/src/index.ts` | 185 | `applyPatchToDir({ patchedDir: depNode.dir, patchFilePath: ... })` triggered during `pnpm install` |
+
+### Description
+
+The same path traversal root cause as VULN-6 applies to file deletion effects. A patch with `deleted file mode 100644` triggers the "file deletion" effect type in `interpretParsedPatchFile`. The `executeEffects` function for a deletion effect calls `fs.unlinkSync(eff.path)` with the unsanitized path from the `diff --git a/PATH` header. The `// TODO: integrity checks` comment at `apply.js:20` confirms the authors were aware that validation was missing.
+
+```javascript
+// apply.js:13-22 (vulnerable -- file deletion effect)
+case 'file deletion': {
+  const eff = effect
+  // TODO: integrity checks   <-- authors knew this was missing
+  if (!opts.dryRun) {
+    fs.unlinkSync(eff.path)   // deletes arbitrary path without validation
+  }
+  break
+}
+```
+
+The `diff --git` header `a/../../../../../../../../../../tmp/vuln7_target b/../../../../../../../../../../tmp/vuln7_target` with `deleted file mode 100644` triggers the file deletion effect. The `interpretParsedPatchFile` function at `parse.js:224` uses `diffLineFromPath` (from the `diff --git a/` path) as `eff.path`, resolving to `/tmp/vuln7_target` when the process CWD is inside the virtual store.
+
+### Attack Scenario
+
+1. Attacker gains the ability to contribute a `.patch` file to a project (pull request, compromised contributor, or compromised CI).
+2. Attacker crafts a patch file with a deletion header whose path traverses out of the package directory: `diff --git a/../../../../../../../../../../home/user/.ssh/authorized_keys b/../../../../../../../../../../home/user/.ssh/authorized_keys` with `deleted file mode 100644`.
+3. Victim runs `pnpm install`.
+4. pnpm applies the malicious patch and `fs.unlinkSync` deletes the target file, removing SSH keys, credentials, or any other critical file the process has access to.
+
+### Proof of Concept
+
+```bash
+# Prerequisites: setup.sh must have been run (verdaccio on localhost:4873)
+bash autofyn_audit/exploits/vuln7_patch_traversal_delete/exploit.sh
+# Expected: PASS -- /tmp/vuln7_target deleted by malicious patch
+```
+
+The exploit publishes a trivial package, runs an initial `pnpm install`, then adds a malicious `.patch` file with a deletion effect and `pnpm-workspace.yaml` with `patchedDependencies`. Before the second install, the target file `/tmp/vuln7_target` is created. After the install, the file is absent, demonstrating arbitrary file deletion outside the package sandbox.
+
+### Impact
+
+Arbitrary file deletion as the user running `pnpm install`. An attacker can delete SSH keys, CI/CD credential files, lock files, database files, or any other file the process has access to. This can cause denial of service (deleting critical system or application files), disrupt CI/CD pipelines, or be chained with other attacks (delete a credential file, then write a replacement via VULN-6). No content verification is performed before deletion — the `// TODO: integrity checks` comment in the source confirms this was a known omission.
+
+### Remediation
+
+Same root cause as VULN-6; the same fixes apply:
+
+1. **Validate paths at effect execution time:** Resolve `eff.path` against the package root and reject any path that escapes with a `path.resolve` + prefix check before calling `fs.unlinkSync`.
+2. **Sanitize at parse time:** Reject any parsed path containing `..` components in `parse.js`.
+3. **Sandbox the CWD:** Resolve all effect paths against the package directory before executing, rather than relying on `process.chdir`.
+4. **Implement the TODO:** The `// TODO: integrity checks` comment at `apply.js:20` should be resolved: verify the file to be deleted matches the expected content from the patch hunk before deleting it, and verify the path is within bounds.
+
+---
+
 ## Conclusion
 
-All five vulnerabilities are confirmed and independently reproducible against pnpm v11.2.2 at commit 976504f. VULN-1 is the most severe, as it silently undermines the supply chain trust model that `--frozen-lockfile` is meant to provide. VULN-2 and VULN-3 enable credential theft through common supply chain attack patterns. VULN-4 demonstrates a defense-in-depth gap where pnpm delegates all protocol validation to git rather than validating lockfile inputs itself. VULN-5 reveals that the `allowBuilds` security policy is incomplete: it blocks lifecycle scripts but allows bin entries to be linked, enabling PATH hijacking from a package the operator believed was fully contained.
+All seven vulnerabilities are confirmed and independently reproducible against pnpm v11.2.2 at commit 976504f. VULN-1 is the most severe, as it silently undermines the supply chain trust model that `--frozen-lockfile` is meant to provide. VULN-2 and VULN-3 enable credential theft through common supply chain attack patterns. VULN-4 demonstrates a defense-in-depth gap where pnpm delegates all protocol validation to git rather than validating lockfile inputs itself. VULN-5 reveals that the `allowBuilds` security policy is incomplete: it blocks lifecycle scripts but allows bin entries to be linked, enabling PATH hijacking from a package the operator believed was fully contained. VULN-6 and VULN-7 expose the patch application pipeline as a path traversal vector: a malicious `.patch` file committed to a project can write to or delete arbitrary files on the filesystem during `pnpm install`, with no path validation anywhere in the pipeline.
 
-Recommended remediation priority: VULN-1 > VULN-4 > VULN-5 > VULN-2 > VULN-3.
+Recommended remediation priority: VULN-1 > VULN-6 > VULN-7 > VULN-4 > VULN-5 > VULN-2 > VULN-3.
