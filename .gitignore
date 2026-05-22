@@ -61,3 +61,6 @@ __fixtures__/custom-modules-dir/patches/
 /target
 /bench-work-env
 .pacquet
+
+## pnpm store created during audit
+.pnpm-store
