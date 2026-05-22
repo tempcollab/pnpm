@@ -23,6 +23,8 @@ pkill -f "verdaccio.*config.yaml" 2>/dev/null || true
 rm -rf /tmp/pnpm-audit-* 2>/dev/null || true
 rm -f /tmp/vuln2_captured_headers.json 2>/dev/null || true
 rm -f /tmp/vuln3_captured_headers.json 2>/dev/null || true
+rm -f /tmp/vuln4_pwned 2>/dev/null || true
+rm -f /tmp/vuln5_postinstall_ran /tmp/vuln5_bin_executed 2>/dev/null || true
 
 # Clean up verdaccio storage
 rm -rf "$SCRIPT_DIR/.verdaccio" 2>/dev/null || true

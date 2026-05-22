@@ -10,15 +10,17 @@
 
 ## Executive Summary
 
-This audit identified three independently reproducible security vulnerabilities in pnpm v11.2.2. All three vulnerabilities have been confirmed with live proof-of-concept exploit scripts against the source-built binary at commit 976504f.
+This audit identified five independently reproducible security vulnerabilities in pnpm v11.2.2. All five vulnerabilities have been confirmed with live proof-of-concept exploit scripts against the source-built binary at commit 976504f.
 
 | ID | Title | Severity | CVSS v3.1 |
 |----|-------|----------|-----------|
 | VULN-1 | Integrity Check Bypass via Missing Lockfile Integrity Field | Critical | 8.7 |
 | VULN-2 | Auth Token Leakage on HTTP Redirect (Same Host) | High | 7.4 |
 | VULN-3 | .npmrc Environment Variable Exfiltration via Scoped Registry | Medium | 5.5 |
+| VULN-4 | Git ext:: Protocol Injection via Lockfile (Conditional RCE) | Medium | 6.4 |
+| VULN-5 | Bin Linking Bypasses allowBuild Security Policy (PATH Hijacking) | Medium | 6.3 |
 
-The most severe finding (VULN-1) enables silent supply chain compromise: an attacker who can modify a project's lockfile can cause `pnpm install --frozen-lockfile` to install tampered packages without any integrity error or warning.
+The most severe finding (VULN-1) enables silent supply chain compromise: an attacker who can modify a project's lockfile can cause `pnpm install --frozen-lockfile` to install tampered packages without any integrity error or warning. VULN-4 and VULN-5 further demonstrate that the lockfile and the `allowBuilds` security policy both lack validation that a determined attacker can exploit.
 
 ---
 
@@ -258,8 +260,145 @@ High confidentiality impact with cross-boundary scope. The attack vector is loca
 
 ---
 
+---
+
+## VULN-4: Git ext:: Protocol Injection via Lockfile (Conditional RCE)
+
+**Severity:** Medium  
+**CVSS v3.1 Score:** 6.4 (AV:N/AC:H/PR:L/UI:N/S:U/C:H/I:H/A:N)  
+**Proof of Concept:** `exploits/vuln4_git_ext_rce/exploit.sh`
+
+### Affected Code
+
+| File | Lines | Role |
+|------|-------|------|
+| `fetching/git-fetcher/src/index.ts` | 32, 35 | `resolution.repo` passed unsanitized to `execGit(['remote', 'add', ...]`) and `execGit(['clone', ...])` |
+| `fetching/git-fetcher/src/index.ts` | 97-101 | `execGit` wraps `safeExeca('git', args)` with `shell: false` |
+| `resolving/git-resolver/src/parseBareSpecifier.ts` | 23-32 | `gitProtocols` allowlist blocks `ext::` from package.json but NOT from lockfile entries |
+| `resolving/git-resolver/src/index.ts` | 28-52 | Early return when lockfile entry exists, skipping re-resolution through the allowlist |
+
+### Description
+
+The git-fetcher at `fetching/git-fetcher/src/index.ts` passes `resolution.repo` from the lockfile directly to `git clone` (line 35, non-shallow path) or to `git remote add origin` (line 32, shallow path) without any URL or protocol validation. The `parseBareSpecifier` function in `git-resolver` maintains a `gitProtocols` allowlist that blocks `ext::` and other unsafe protocols, but this check only applies during package.json resolution — it is bypassed entirely when the resolver returns early at lines 34-51 of `resolving/git-resolver/src/index.ts` because the package already has a lockfile entry. When `GIT_ALLOW_PROTOCOL=ext` is set in the environment, an attacker who modifies `pnpm-lock.yaml` can set `repo: 'ext::COMMAND ARGS'` to achieve arbitrary command execution via git's remote-ext helper.
+
+```typescript
+// fetching/git-fetcher/src/index.ts:28-36 (vulnerable path)
+const gitFetcher: GitFetcher = async (cafs, resolution, opts) => {
+  const tempLocation = await cafs.tempDir()
+  if (allowedHosts.size > 0 && shouldUseShallow(resolution.repo, allowedHosts)) {
+    await execGit(['remote', 'add', 'origin', resolution.repo], { cwd: tempLocation })
+    // ... shallow fetch
+  } else {
+    await execGit(['clone', resolution.repo, tempLocation])  // resolution.repo unsanitized
+  }
+```
+
+The `ext::` git transport splits the string after `ext::` on spaces to form the command and arguments passed to `execvp`. So `ext::touch /tmp/vuln4_pwned` causes git to execute `touch /tmp/vuln4_pwned` before returning, even though the clone itself fails.
+
+> **PoC limitation:** The exploit sets `GIT_ALLOW_PROTOCOL=ext:file:https` explicitly to demonstrate the code path. In default git configurations, `ext::` is blocked by git's own protocol allow-list. The vulnerability is the missing validation in pnpm's code; the `GIT_ALLOW_PROTOCOL` env var is the precondition. Some CI environments enable `ext` in `GIT_ALLOW_PROTOCOL` for advanced git-hosting setups.
+
+### Attack Scenario
+
+1. Attacker gains write access to the project's `pnpm-lock.yaml` (pull request, compromised CI, compromised developer machine, or direct repo access).
+2. Attacker edits the git resolution entry's `repo:` field to `'ext::MALICIOUS_COMMAND'`.
+3. Victim CI has `GIT_ALLOW_PROTOCOL=ext` set (some CI environments enable this for advanced git hosting).
+4. `pnpm install --frozen-lockfile` passes the tampered `repo:` value directly to `git clone`, which invokes `MALICIOUS_COMMAND` via the git-remote-ext transport.
+
+### Proof of Concept
+
+```bash
+bash autofyn_audit/exploits/vuln4_git_ext_rce/exploit.sh
+# Expected: PASS -- marker file /tmp/vuln4_pwned created by git-remote-ext
+```
+
+The exploit creates a local bare git repo, installs it as a git dependency to generate a valid lockfile, then tampers the `repo:` field using python3 with proper YAML single-quoting to ensure the space in `ext::touch /tmp/vuln4_pwned` is preserved. After clearing the store and re-running install with `GIT_ALLOW_PROTOCOL=ext:file:https`, the marker file is created before git reports a clone failure.
+
+### Impact
+
+Conditional RCE. The defense-in-depth gap means pnpm relies entirely on git's own default-deny for `ext::`. If that default ever changes, or if a CI environment enables `ext::`, the lockfile becomes an RCE vector. The missing validation is pnpm's responsibility: the lockfile is an attacker-controlled input that pnpm should validate before forwarding to git.
+
+### Remediation
+
+1. **Validate `resolution.repo` against a protocol allowlist** in `git-fetcher/src/index.ts` before passing to git, rejecting any URL that does not begin with a known-safe protocol (`https://`, `http://`, `git://`, `ssh://`, `file://`).
+2. **Add `--` separator** between flags and positional args in all `execGit` calls (e.g., `execGit(['clone', '--', resolution.repo, tempLocation])`) to prevent flag injection.
+3. **Apply the `gitProtocols` allowlist at the fetcher level**, not only during package.json resolution.
+
+---
+
+## VULN-5: Bin Linking Bypasses allowBuild Security Policy (PATH Hijacking)
+
+**Severity:** Medium  
+**CVSS v3.1 Score:** 6.3 (AV:N/AC:L/PR:L/UI:N/S:U/C:L/I:H/A:N)  
+**Proof of Concept:** `exploits/vuln5_bin_shadow/exploit.sh`
+
+### Affected Code
+
+| File | Lines | Role |
+|------|-------|------|
+| `installing/deps-installer/src/install/index.ts` | 1651 | `linkAllBins()` called for ALL `newDepPaths` with no `allowBuild` check |
+| `installing/deps-installer/src/install/index.ts` | 1660-1698 | Project-level bin linking includes all direct deps regardless of `allowBuild` status |
+| `building/during-install/src/index.ts` | 90-108 | `allowBuild` sets `ignoreScripts = true` to block lifecycle scripts — does NOT block bin linking |
+| `building/during-install/src/index.ts` | 176 | `linkBinsOfDependencies()` called unconditionally before `ignoreScripts` gates `runPostinstallHooks` |
+| `@pnpm/npm-lifecycle` (vendored) | `extendPath()` | Prepends `node_modules/.bin` to PATH for all lifecycle scripts (standard npm behavior) |
+
+### Description
+
+When a package is blocked by `allowBuilds: { pkg: false }` in `pnpm-workspace.yaml`, pnpm correctly sets `ignoreScripts = true` for that package (lines 90-108 of `building/during-install/src/index.ts`), which prevents its `postinstall`, `preinstall`, and `install` lifecycle scripts from running. However, bin entries are still linked into `node_modules/.bin/` by two independent code paths that are completely unaware of `allowBuild` status:
+
+1. **Per-package bin linking** (`during-install` line 176): `linkBinsOfDependencies()` is called unconditionally in `buildDependency` regardless of `ignoreScripts` — it runs before the `ignoreScripts` check gates `runPostinstallHooks`.
+2. **Project-level bin linking** (`deps-installer` line 1651 and 1679): `linkAllBins()` and `linkBinsOfPackages()` iterate all dependency graph nodes and all direct deps without any `allowBuild` check.
+
+A malicious package can declare `bin` entries that shadow common system commands (`node`, `npm`, `git`, `curl`, `sh`). Even when explicitly blocked by security policy, these bins appear in PATH whenever any other package's lifecycle script runs (because `extendPath` prepends `node_modules/.bin` to PATH), or when the user runs `pnpm exec`, `pnpm run`, or any npm script.
+
+```typescript
+// building/during-install/src/index.ts:88-113 (allowBuild sets ignoreScripts only)
+const allowed = allowBuild(node.name, node.version)
+switch (allowed) {
+  case false:
+    ignoreScripts = true  // only blocks lifecycle scripts
+    break
+  // ... bin linking at line 176 is NOT conditional on ignoreScripts
+}
+return buildDependency(depPath, depGraph, { ...buildDepOpts, ignoreScripts })
+
+// buildDependency line 176: always runs regardless of ignoreScripts
+await linkBinsOfDependencies(depNode, depGraph, opts)
+// ... only this is gated on ignoreScripts:
+const hasSideEffects = !opts.ignoreScripts && await runPostinstallHooks(...)
+```
+
+### Attack Scenario
+
+1. Attacker publishes a package with `"bin": { "node": "./malicious.js" }` and a postinstall script.
+2. Victim adds it as a dependency and explicitly blocks it via `allowBuilds: { attacker-pkg: false }` in `pnpm-workspace.yaml`, believing this prevents any code execution.
+3. `pnpm install` blocks the package's postinstall script — the security policy appears to work.
+4. However, `node_modules/.bin/node` is silently linked to the attacker's `malicious.js`.
+5. Any project script or any allowed package's postinstall that invokes `node` executes the attacker's binary instead of the real Node.js.
+
+### Proof of Concept
+
+```bash
+# Prerequisites: setup.sh must have been run (verdaccio on localhost:4873)
+bash autofyn_audit/exploits/vuln5_bin_shadow/exploit.sh
+# Expected: PASS -- postinstall blocked, but node_modules/.bin/curl linked to evil.sh
+```
+
+The exploit publishes `evil-shadow@1.0.0` with `"bin": { "curl": "./evil.sh" }` and a `postinstall` that creates `/tmp/vuln5_postinstall_ran`. The test project blocks it via `allowBuilds: { evil-shadow: false }`. After install, the postinstall marker is absent (correctly blocked) but `node_modules/.bin/curl` points to `evil.sh` (policy bypass). Running the linked bin creates `/tmp/vuln5_bin_executed`, confirming the hijack.
+
+### Impact
+
+PATH hijacking from a package that is supposedly blocked by security policy. Users and security tooling that rely on `allowBuilds` to sandbox a suspicious package have a false sense of security — the package can still shadow any command name it chooses, affecting all scripts in the project. Undermines the core trust model of the `allowBuilds` feature.
+
+### Remediation
+
+1. **Skip bin linking for blocked packages:** In both `linkAllBins` (called at `deps-installer` line 1651) and the project-level `linkBinsOfPackages` (line 1679), check `allowBuild` status and skip packages where `allowBuild(name, version) === false`.
+2. **Alternatively, move bin linking after the `ignoreScripts` check** in `buildDependency` so that `ignoreScripts = true` gates both lifecycle scripts and bin linking.
+3. **Document the limitation:** Until fixed, document that `allowBuilds: false` blocks scripts but not bin linking, so users understand the incomplete protection.
+
+---
+
 ## Conclusion
 
-All three vulnerabilities are confirmed and independently reproducible against pnpm v11.2.2 at commit 976504f. VULN-1 is the most severe, as it silently undermines the supply chain trust model that `--frozen-lockfile` is meant to provide. VULN-2 and VULN-3 are high severity findings that enable credential theft through common supply chain attack patterns.
+All five vulnerabilities are confirmed and independently reproducible against pnpm v11.2.2 at commit 976504f. VULN-1 is the most severe, as it silently undermines the supply chain trust model that `--frozen-lockfile` is meant to provide. VULN-2 and VULN-3 enable credential theft through common supply chain attack patterns. VULN-4 demonstrates a defense-in-depth gap where pnpm delegates all protocol validation to git rather than validating lockfile inputs itself. VULN-5 reveals that the `allowBuilds` security policy is incomplete: it blocks lifecycle scripts but allows bin entries to be linked, enabling PATH hijacking from a package the operator believed was fully contained.
 
-Recommended remediation priority: VULN-1 > VULN-3 > VULN-2.
+Recommended remediation priority: VULN-1 > VULN-4 > VULN-5 > VULN-2 > VULN-3.
