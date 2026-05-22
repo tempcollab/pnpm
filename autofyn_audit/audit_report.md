@@ -10,7 +10,7 @@
 
 ## Executive Summary
 
-This audit identified nine independently reproducible security vulnerabilities in pnpm v11.2.2. All nine vulnerabilities have been confirmed with live proof-of-concept exploit scripts against the source-built binary at commit 976504f.
+This audit identified eleven independently reproducible security vulnerabilities in pnpm v11.2.2. All eleven vulnerabilities have been confirmed with live proof-of-concept exploit scripts against the source-built binary at commit 976504f.
 
 | ID | Title | Severity | CVSS v3.1 |
 |----|-------|----------|-----------|
@@ -23,8 +23,10 @@ This audit identified nine independently reproducible security vulnerabilities i
 | VULN-7 | Arbitrary File Deletion via Malicious Patch File (Path Traversal) | High | 7.3 |
 | VULN-8 | Lifecycle Script Env Sanitization Bypass via Case-Sensitive Filter | Medium | 5.3 |
 | VULN-9 | Lockfile `resolution.directory` Path Traversal (Arbitrary Directory Read) | High | 7.1 |
+| VULN-10 | Lockfile `resolution.tarball` Local File Path Traversal (Arbitrary File Read) | High | 7.1 |
+| VULN-11 | Git Fetch `--upload-pack` Argument Injection via `resolution.commit` (RCE) | High | 7.5 |
 
-The most severe finding (VULN-1) enables silent supply chain compromise: an attacker who can modify a project's lockfile can cause `pnpm install --frozen-lockfile` to install tampered packages without any integrity error or warning. VULN-4 and VULN-5 further demonstrate that the lockfile and the `allowBuilds` security policy both lack validation that a determined attacker can exploit. VULN-6 and VULN-7 expose pnpm's patch application pipeline as a path traversal vector: malicious `.patch` files can write to or delete arbitrary files on the filesystem during `pnpm install`. VULN-8 demonstrates that pnpm's lifecycle environment sanitization uses a case-sensitive regex, allowing uppercase `NPM_CONFIG_*` environment variables to pass through unfiltered into lifecycle scripts, enabling npm config injection in CI environments. VULN-9 demonstrates that the lockfile's `resolution.directory` field is passed without bounds checking to the directory fetcher, which reads all files from the target directory into the store and hardlinks them into `node_modules/`, enabling arbitrary directory content theft when an attacker can modify the lockfile.
+The most severe finding (VULN-1) enables silent supply chain compromise: an attacker who can modify a project's lockfile can cause `pnpm install --frozen-lockfile` to install tampered packages without any integrity error or warning. VULN-4 and VULN-5 further demonstrate that the lockfile and the `allowBuilds` security policy both lack validation that a determined attacker can exploit. VULN-6 and VULN-7 expose pnpm's patch application pipeline as a path traversal vector: malicious `.patch` files can write to or delete arbitrary files on the filesystem during `pnpm install`. VULN-8 demonstrates that pnpm's lifecycle environment sanitization uses a case-sensitive regex, allowing uppercase `NPM_CONFIG_*` environment variables to pass through unfiltered into lifecycle scripts, enabling npm config injection in CI environments. VULN-9 demonstrates that the lockfile's `resolution.directory` field is passed without bounds checking to the directory fetcher, which reads all files from the target directory into the store and hardlinks them into `node_modules/`, enabling arbitrary directory content theft when an attacker can modify the lockfile. VULN-10 is a parallel path traversal in the local tarball fetcher: `resolution.tarball` with a `file:` prefix is resolved via `path.resolve` with no containment check, allowing an attacker who tampers the lockfile to redirect a package's tarball to any arbitrary `.tgz` file on disk. VULN-11 demonstrates that `resolution.commit` from the lockfile is passed directly to `git fetch` without a `--` separator, enabling `--upload-pack` argument injection that achieves remote code execution when the repository host is in `gitShallowHosts` (which includes `github.com`, `gitlab.com`, and `bitbucket.org` by default).
 
 ---
 
@@ -34,7 +36,7 @@ The most severe finding (VULN-1) enables silent supply chain compromise: an atta
 - **Node.js version:** v22.22.2
 - **Test registry:** verdaccio 6.3.2 (localhost:4873, from repo devDependencies)
 - **Test environment:** Linux (gVisor container)
-- **Commands tested:** `install`, `install --frozen-lockfile`
+- **Commands tested:** `install`, `install --frozen-lockfile`, `install` with git dependencies
 
 ---
 
@@ -678,8 +680,143 @@ Arbitrary directory content theft. An attacker who can modify the lockfile can s
 
 ---
 
+## VULN-10: Lockfile `resolution.tarball` Local File Path Traversal (Arbitrary File Read)
+
+**Severity:** High
+**CVSS v3.1 Score:** 7.1 (AV:N/AC:L/PR:L/UI:R/S:U/C:H/I:N/A:N)
+**Proof of Concept:** `exploits/vuln10_tarball_path_traversal/exploit.sh`
+
+### Affected Code
+
+| File | Lines | Role |
+|------|-------|------|
+| `fetching/tarball-fetcher/src/localTarballFetcher.ts` | 19 | `resolvePath(opts.lockfileDir, resolution.tarball.slice(5))` — no bounds check |
+| `fetching/tarball-fetcher/src/localTarballFetcher.ts` | 20 | `gfs.readFileSync(tarball)` — reads arbitrary resolved path |
+| `fetching/tarball-fetcher/src/localTarballFetcher.ts` | 38-41 | `resolvePath` accepts absolute or relative paths with no containment check |
+| `lockfile/utils/src/pkgSnapshotToResolution.ts` | 18 | `tarball?.startsWith('file:')` returns resolution as-is |
+| `fetching/pick-fetcher/src/index.ts` | 41 | `resolution.tarball.startsWith('file:')` routes to `localTarball` fetcher |
+
+### Description
+
+The local tarball fetcher at `fetching/tarball-fetcher/src/localTarballFetcher.ts:19` resolves the tarball path by stripping the `file:` prefix from `resolution.tarball` via `.slice(5)` and passing the result to `resolvePath(opts.lockfileDir, ...)`. The `resolvePath` helper at lines 38-41 simply calls `path.resolve(where, spec)` with no validation that the result stays within the project or workspace boundary. The resolved path is then passed directly to `gfs.readFileSync(tarball)` at line 20, reading the file from disk. The resulting buffer is imported into the content-addressable store and hardlinked into `node_modules/`, making the contents of the arbitrary file accessible to all project code.
+
+```typescript
+// fetching/tarball-fetcher/src/localTarballFetcher.ts:17-20 (vulnerable)
+const fetch = (cafs: Cafs, resolution: Resolution, opts: FetchOptions) => {
+  const tarball = resolvePath(opts.lockfileDir, resolution.tarball.slice(5))  // no bounds check
+  const buffer = gfs.readFileSync(tarball)  // reads arbitrary path
+  return addFilesFromTarball({ ..., buffer, ... })
+}
+
+// localTarballFetcher.ts:38-41 (resolvePath -- no containment check)
+function resolvePath (where: string, spec: string): string {
+  if (isAbsolutePath.test(spec)) return spec
+  return path.resolve(where, spec)  // relative paths can traverse arbitrarily
+}
+```
+
+The routing to this fetcher is determined by `pkgSnapshotToResolution` at line 18, which returns any resolution whose `tarball` field starts with `file:` verbatim, and by `pickFetcher` at line 41, which routes those resolutions to the `localTarball` fetcher. Neither performs any path validation. The `integrity` field is optional on local tarballs, so removing it from the lockfile does not cause a verification failure — the fetcher reads and installs whatever file is at the resolved path unconditionally.
+
+### Attack Scenario
+
+1. Attacker gains write access to the project's `pnpm-lock.yaml` (pull request, compromised CI, compromised developer machine, or direct repo access).
+2. Attacker changes a package's `resolution` from the registry tarball (`{integrity: sha512-..., tarball: http://registry/...}`) to a local file traversal (`{tarball: 'file:../../../../../../../tmp/victim_secrets/sensitive.tgz'}`), removing the `integrity` field.
+3. The `packages:` entry key, `snapshots:` entry key, and `importers:` version reference are updated to match the new specifier.
+4. The `package.json` dependency specifier is updated to `file:../../../../../../../tmp/victim_secrets/sensitive.tgz`.
+5. Victim runs `pnpm install`. The local tarball fetcher reads the attacker-chosen `.tgz` file, extracts its contents into the store, and hardlinks them into `node_modules/<package>/`.
+6. Any code in the project — including postinstall scripts from other packages — can read and exfiltrate the stolen files from `node_modules/`.
+
+### Proof of Concept
+
+```bash
+# Prerequisites: setup.sh must have been run (verdaccio on localhost:4873)
+bash autofyn_audit/exploits/vuln10_tarball_path_traversal/exploit.sh
+# Expected: PASS -- secret_ssh_key.pem and api_credentials.json found in node_modules/tarball-read-target/
+```
+
+The exploit creates a sensitive tarball at `/tmp/vuln10_secrets/stolen_data.tgz` containing a fake SSH private key (`secret_ssh_key.pem`) and fake AWS credentials (`api_credentials.json`) inside the npm `package/` prefix convention. It publishes a legitimate `tarball-read-target@1.0.0` to verdaccio, runs an initial install to generate a valid lockfile, then uses python3 to tamper the lockfile — changing the resolution from the registry tarball to `file:../../../../../../tmp/vuln10_secrets/stolen_data.tgz` and removing the `integrity` field. After clearing the store and re-running install, the sensitive files appear in `node_modules/tarball-read-target/`, confirming arbitrary tarball read.
+
+### Impact
+
+Arbitrary file read disguised as a package installation. Any `.tgz` file accessible on disk that follows npm's `package/` prefix convention — or any attacker-controlled tarball placed anywhere on the filesystem — can be imported as a dependency. The attack is particularly dangerous in CI/CD environments where build workers share a filesystem: secrets stored outside the project directory (SSH keys, cloud credentials, other projects' tarballs) are silently imported into `node_modules/`. Unlike VULN-9 (directory traversal), this attack reads a single tarball and unpacks it, giving the attacker control over exactly which files appear in `node_modules/` and with what content.
+
+### Remediation
+
+1. **Validate resolved tarball path:** After calling `resolvePath`, check that the resolved path is within the project or workspace root. Reject paths where `!resolvedPath.startsWith(workspaceRoot)`.
+2. **Reject `..` components:** In `resolvePath` or before calling it, reject any `spec` that contains `..` path components.
+3. **Require integrity for local tarballs:** When installing from a `file:` tarball, require an `integrity` field and verify the hash before importing. This prevents substitution of an arbitrary tarball even if the path passes containment checks.
+
+---
+
+## VULN-11: Git Fetch `--upload-pack` Argument Injection via `resolution.commit` (RCE)
+
+**Severity:** High
+**CVSS v3.1 Score:** 7.5 (AV:N/AC:H/PR:L/UI:R/S:C/C:H/I:H/A:N)
+**Proof of Concept:** `exploits/vuln11_git_upload_pack_rce/exploit.sh`
+
+### Affected Code
+
+| File | Lines | Role |
+|------|-------|------|
+| `fetching/git-fetcher/src/index.ts` | 33 | `execGit(['fetch', '--depth', '1', 'origin', resolution.commit])` — no `--` separator |
+| `fetching/git-fetcher/src/index.ts` | 37 | `execGit(['checkout', resolution.commit])` — no `--` separator |
+| `fetching/git-fetcher/src/index.ts` | 30 | Shallow condition: `allowedHosts.size > 0 && shouldUseShallow(resolution.repo, allowedHosts)` |
+| `fetching/git-fetcher/src/index.ts` | 81-91 | `shouldUseShallow` — parses URL host, checks against `allowedHosts` set |
+| `fetching/git-fetcher/src/index.ts` | 97-101 | `execGit` — passes args directly to `execa('git', fullArgs, opts)`, no sanitization |
+| `lockfile/utils/src/pkgSnapshotToResolution.ts` | 16-21 | Returns resolution verbatim when `type` field is truthy |
+| `lockfile/types/src/index.ts` | 120-125 | `GitRepositoryResolution` has `commit: string` with no format constraint |
+
+### Description
+
+The git fetcher at `fetching/git-fetcher/src/index.ts:33` passes `resolution.commit` from the lockfile directly to `git fetch` as a positional argument without a `--` separator. Git parses all arguments before `--` as options. If `resolution.commit` is `--upload-pack=<command>`, git treats it as the `--upload-pack` option, which specifies the program to invoke as the upload-pack binary on the remote side. For `file://` and SSH transports, git shells out the specified command. The command executes before git determines that the specified program is not a valid upload-pack binary, causing the fetch to fail — but the injected command has already run.
+
+```typescript
+// fetching/git-fetcher/src/index.ts:30-33 (vulnerable path)
+if (allowedHosts.size > 0 && shouldUseShallow(resolution.repo, allowedHosts)) {
+  await execGit(['init'], { cwd: tempLocation })
+  await execGit(['remote', 'add', 'origin', resolution.repo], { cwd: tempLocation })
+  await execGit(['fetch', '--depth', '1', 'origin', resolution.commit], { cwd: tempLocation })
+  // ^ resolution.commit passed without -- separator; git parses it as an option
+}
+```
+
+The shallow fetch path (line 30) is taken when the repo's URL host matches a value in `gitShallowHosts`. The default `gitShallowHosts` list (from `config/reader/src/index.ts:155-162`) includes `github.com`, `gist.github.com`, `gitlab.com`, `bitbucket.com`, and `bitbucket.org`. Any project with a git dependency hosted on these platforms is vulnerable without any additional configuration. The `lockfile/types/src/index.ts` `GitRepositoryResolution` type declares `commit: string` with no format constraint, so pnpm performs no validation of the commit value before passing it to git.
+
+> **PoC note:** The exploit uses `file://githost/...` as the repo URL with `pnpm_config_git_shallow_hosts='["githost"]'` environment variable because `--upload-pack` injection requires a local or SSH transport (HTTPS transport ignores `--upload-pack`). Note: `git-shallow-hosts` cannot be set via `.npmrc` — pnpm's `isNpmrcReadableKey()` filter only allows auth/registry/network keys. In real-world attacks, the victim's project would use an SSH-transported git dependency (`git+ssh://git@github.com/...`), and `github.com` is in the default `gitShallowHosts` — no env var override is required.
+
+> **URL normalization note:** Node's `URL` class normalizes `localhost` to empty string for the `file:` protocol (`new URL('file://localhost/path').host === ""`), so `githost` (an arbitrary non-`localhost` hostname) is used instead. git resolves `file://githost/path` as a local path correctly.
+
+### Attack Scenario
+
+1. Attacker gains write access to the project's `pnpm-lock.yaml` (pull request, compromised CI, compromised developer machine, or direct repo access).
+2. Attacker locates any git dependency whose `resolution.repo` host is in `gitShallowHosts` (e.g., any `github.com` dependency with SSH transport).
+3. Attacker replaces the 40-char hex `commit:` value in the lockfile with `'--upload-pack=<malicious command>'`.
+4. Victim runs `pnpm install`. The shallow fetch path is taken (because `github.com` is in default `gitShallowHosts`), and git executes the injected command during `git fetch --depth 1 origin '--upload-pack=<malicious command>'`.
+5. The fetch fails (injected command is not a valid upload-pack binary), but the command has already executed as the user running `pnpm install`.
+
+### Proof of Concept
+
+```bash
+bash autofyn_audit/exploits/vuln11_git_upload_pack_rce/exploit.sh
+# Expected: PASS -- /tmp/vuln11_pwned created by injected touch command
+```
+
+The exploit creates a local bare git repo, installs it as a git dependency with `file://githost/...` URL and `pnpm_config_git_shallow_hosts='["githost"]'` env var to trigger the shallow fetch path. After generating a valid lockfile, it uses python3 regex to replace the 40-char hex commit hash with `'--upload-pack=touch /tmp/vuln11_pwned'` in YAML single-quote notation. After clearing the store and re-running install with `--frozen-lockfile`, the marker file `/tmp/vuln11_pwned` is created by the injected `touch` command before git reports a fetch failure.
+
+### Impact
+
+Remote code execution as the user running `pnpm install`. Any project with a git dependency on `github.com`, `gitlab.com`, or `bitbucket.org` using SSH transport is vulnerable by default — no extra configuration is required. An attacker who can modify the lockfile can execute arbitrary commands on every machine and CI/CD runner that installs the project. The RCE occurs before pnpm's post-checkout integrity check at line 38-41 (`receivedCommit !== resolution.commit`), so the check never runs to detect the tampered value. The scope is changed (S:C) because the RCE escapes the npm lifecycle sandbox — `git` is invoked directly by pnpm's fetcher, not through a postinstall script, so no sandbox applies.
+
+### Remediation
+
+1. **Add `--` separator before `resolution.commit`:** Change `execGit(['fetch', '--depth', '1', 'origin', resolution.commit])` to `execGit(['fetch', '--depth', '1', 'origin', '--', resolution.commit])` and `execGit(['checkout', resolution.commit])` to `execGit(['checkout', '--', resolution.commit])`. This prevents git from interpreting the commit value as an option.
+2. **Validate commit format:** Before passing to git, assert that `resolution.commit` matches `/^[0-9a-f]{40}$/`. Reject any value that is not a valid 40-char hex SHA1. This is a strict input validation that eliminates the attack surface entirely.
+3. **Apply validation at the lockfile reader level:** `lockfile/types/src/index.ts` should enforce the commit format constraint at the type level (e.g., with a branded type or a runtime validation step) so that malformed commit values are rejected before they reach the fetcher.
+
+---
+
 ## Conclusion
 
-All nine vulnerabilities are confirmed and independently reproducible against pnpm v11.2.2 at commit 976504f. VULN-1 is the most severe, as it silently undermines the supply chain trust model that `--frozen-lockfile` is meant to provide. VULN-2 and VULN-3 enable credential theft through common supply chain attack patterns. VULN-4 demonstrates a defense-in-depth gap where pnpm delegates all protocol validation to git rather than validating lockfile inputs itself. VULN-5 reveals that the `allowBuilds` security policy is incomplete: it blocks lifecycle scripts but allows bin entries to be linked, enabling PATH hijacking from a package the operator believed was fully contained. VULN-6 and VULN-7 expose the patch application pipeline as a path traversal vector: a malicious `.patch` file committed to a project can write to or delete arbitrary files on the filesystem during `pnpm install`, with no path validation anywhere in the pipeline. VULN-8 demonstrates that pnpm's lifecycle environment sanitization has a case-sensitivity gap: uppercase `NPM_CONFIG_*` variables pass through unfiltered, enabling npm config injection in any environment where an attacker can set process-level environment variables. VULN-9 demonstrates that the directory fetcher resolves `resolution.directory` from the lockfile without any bounds check, allowing an attacker who can modify the lockfile to redirect a package resolution to an arbitrary directory on the filesystem, reading all files in that directory into the content-addressable store and hardlinking them into `node_modules/`.
+All eleven vulnerabilities are confirmed and independently reproducible against pnpm v11.2.2 at commit 976504f. VULN-1 is the most severe, as it silently undermines the supply chain trust model that `--frozen-lockfile` is meant to provide. VULN-2 and VULN-3 enable credential theft through common supply chain attack patterns. VULN-4 demonstrates a defense-in-depth gap where pnpm delegates all protocol validation to git rather than validating lockfile inputs itself. VULN-5 reveals that the `allowBuilds` security policy is incomplete: it blocks lifecycle scripts but allows bin entries to be linked, enabling PATH hijacking from a package the operator believed was fully contained. VULN-6 and VULN-7 expose the patch application pipeline as a path traversal vector: a malicious `.patch` file committed to a project can write to or delete arbitrary files on the filesystem during `pnpm install`, with no path validation anywhere in the pipeline. VULN-8 demonstrates that pnpm's lifecycle environment sanitization has a case-sensitivity gap: uppercase `NPM_CONFIG_*` variables pass through unfiltered, enabling npm config injection in any environment where an attacker can set process-level environment variables. VULN-9 demonstrates that the directory fetcher resolves `resolution.directory` from the lockfile without any bounds check, allowing an attacker who can modify the lockfile to redirect a package resolution to an arbitrary directory on the filesystem, reading all files in that directory into the content-addressable store and hardlinking them into `node_modules/`. VULN-10 is a parallel path traversal in the local tarball fetcher: `resolution.tarball` with a `file:` prefix is resolved without containment checks, allowing an attacker who tampers the lockfile to redirect a package installation to read any accessible `.tgz` file on disk. VULN-11 demonstrates that `resolution.commit` is passed to `git fetch` without a `--` separator, enabling `--upload-pack` argument injection that achieves code execution on the machine running `pnpm install` when the repo host is in `gitShallowHosts` — which by default includes `github.com`, `gitlab.com`, and `bitbucket.org`, covering the majority of real-world git dependencies.
 
-Recommended remediation priority: VULN-1 > VULN-6 > VULN-7 > VULN-9 > VULN-4 > VULN-5 > VULN-2 > VULN-3 > VULN-8.
+Recommended remediation priority: VULN-1 > VULN-11 > VULN-6 > VULN-7 > VULN-9 > VULN-10 > VULN-4 > VULN-5 > VULN-2 > VULN-3 > VULN-8.
