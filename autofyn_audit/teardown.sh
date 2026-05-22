@@ -27,6 +27,7 @@ rm -f /tmp/vuln4_pwned 2>/dev/null || true
 rm -f /tmp/vuln5_postinstall_ran /tmp/vuln5_bin_executed 2>/dev/null || true
 rm -f /tmp/vuln6_pwned /tmp/vuln7_target 2>/dev/null || true
 rm -f /tmp/vuln8_uppercase_registry /tmp/vuln8_lowercase_registry /tmp/vuln8_postinstall_ran 2>/dev/null || true
+rm -rf /tmp/vuln9_secrets 2>/dev/null || true
 
 # Clean up verdaccio storage
 rm -rf "$SCRIPT_DIR/.verdaccio" 2>/dev/null || true

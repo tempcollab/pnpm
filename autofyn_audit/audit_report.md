@@ -10,7 +10,7 @@
 
 ## Executive Summary
 
-This audit identified eight independently reproducible security vulnerabilities in pnpm v11.2.2. All eight vulnerabilities have been confirmed with live proof-of-concept exploit scripts against the source-built binary at commit 976504f.
+This audit identified nine independently reproducible security vulnerabilities in pnpm v11.2.2. All nine vulnerabilities have been confirmed with live proof-of-concept exploit scripts against the source-built binary at commit 976504f.
 
 | ID | Title | Severity | CVSS v3.1 |
 |----|-------|----------|-----------|
@@ -22,8 +22,9 @@ This audit identified eight independently reproducible security vulnerabilities 
 | VULN-6 | Arbitrary File Write via Malicious Patch File (Path Traversal) | High | 7.3 |
 | VULN-7 | Arbitrary File Deletion via Malicious Patch File (Path Traversal) | High | 7.3 |
 | VULN-8 | Lifecycle Script Env Sanitization Bypass via Case-Sensitive Filter | Medium | 5.3 |
+| VULN-9 | Lockfile `resolution.directory` Path Traversal (Arbitrary Directory Read) | High | 7.1 |
 
-The most severe finding (VULN-1) enables silent supply chain compromise: an attacker who can modify a project's lockfile can cause `pnpm install --frozen-lockfile` to install tampered packages without any integrity error or warning. VULN-4 and VULN-5 further demonstrate that the lockfile and the `allowBuilds` security policy both lack validation that a determined attacker can exploit. VULN-6 and VULN-7 expose pnpm's patch application pipeline as a path traversal vector: malicious `.patch` files can write to or delete arbitrary files on the filesystem during `pnpm install`. VULN-8 demonstrates that pnpm's lifecycle environment sanitization uses a case-sensitive regex, allowing uppercase `NPM_CONFIG_*` environment variables to pass through unfiltered into lifecycle scripts, enabling npm config injection in CI environments.
+The most severe finding (VULN-1) enables silent supply chain compromise: an attacker who can modify a project's lockfile can cause `pnpm install --frozen-lockfile` to install tampered packages without any integrity error or warning. VULN-4 and VULN-5 further demonstrate that the lockfile and the `allowBuilds` security policy both lack validation that a determined attacker can exploit. VULN-6 and VULN-7 expose pnpm's patch application pipeline as a path traversal vector: malicious `.patch` files can write to or delete arbitrary files on the filesystem during `pnpm install`. VULN-8 demonstrates that pnpm's lifecycle environment sanitization uses a case-sensitive regex, allowing uppercase `NPM_CONFIG_*` environment variables to pass through unfiltered into lifecycle scripts, enabling npm config injection in CI environments. VULN-9 demonstrates that the lockfile's `resolution.directory` field is passed without bounds checking to the directory fetcher, which reads all files from the target directory into the store and hardlinks them into `node_modules/`, enabling arbitrary directory content theft when an attacker can modify the lockfile.
 
 ---
 
@@ -600,8 +601,85 @@ This ensures that `NPM_CONFIG_REGISTRY`, `NPM_PACKAGE_NAME`, and all other upper
 
 ---
 
+## VULN-9: Lockfile `resolution.directory` Path Traversal (Arbitrary Directory Read)
+
+**Severity:** High
+**CVSS v3.1 Score:** 7.1 (AV:N/AC:L/PR:L/UI:R/S:U/C:H/I:N/A:N)
+**Proof of Concept:** `exploits/vuln9_directory_traversal/exploit.sh`
+
+### Affected Code
+
+| File | Lines | Role |
+|------|-------|------|
+| `fetching/directory-fetcher/src/index.ts` | 30 | `path.resolve(opts.lockfileDir, resolution.directory)` — no bounds check |
+| `lockfile/utils/src/pkgSnapshotToResolution.ts` | 16-21 | Returns `pkgSnapshot.resolution` as-is when `type` field is truthy |
+| `fetching/pick-fetcher/src/index.ts` | 54 | Routes `resolution.type === 'directory'` to `directoryFetcher` |
+| `deps/graph-builder/src/lockfileToDepGraph.ts` | 217, 282-294 | Builds dep graph from lockfile, calls `storeController.fetchPackage` with unsanitized resolution |
+
+### Description
+
+The directory fetcher at `fetching/directory-fetcher/src/index.ts:30` resolves `resolution.directory` from lockfile entries using `path.resolve(opts.lockfileDir, resolution.directory)` with no validation that the resolved path is within the project or workspace boundary.
+
+```typescript
+// fetching/directory-fetcher/src/index.ts:26-31 (vulnerable)
+const directoryFetcher: DirectoryFetcher = (cafs, resolution, opts) => {
+  // Use path.resolve so absolute directories (e.g. cross-drive Windows paths
+  // stored by `file:` deps) are respected instead of being concatenated
+  // onto lockfileDir.
+  const dir = path.resolve(opts.lockfileDir, resolution.directory)  // no bounds check
+  return fetchFromDir(dir)
+}
+```
+
+When a lockfile entry's resolution is changed from a tarball type (`{integrity: ..., tarball: ...}`) to a directory type (`{type: directory, directory: '../../../../../../sensitive_dir'}`), `pkgSnapshotToResolution` at lines 16-21 sees the truthy `type` field and returns the resolution verbatim:
+
+```typescript
+// lockfile/utils/src/pkgSnapshotToResolution.ts:16-21 (routes to directory fetcher)
+if (
+  Boolean((pkgSnapshot.resolution as TarballResolution).type) ||
+  (pkgSnapshot.resolution as TarballResolution).tarball?.startsWith('file:') ||
+  (pkgSnapshot.resolution as TarballResolution).gitHosted === true
+) {
+  return pkgSnapshot.resolution as Resolution  // returned as-is — no path validation
+}
+```
+
+The `pickFetcher` at line 54 routes it to the directory fetcher, which resolves the traversal path to an absolute location and reads all files from that directory into the content-addressable store. Those files are then hardlinked into `node_modules/<package>/`, making sensitive data accessible to any code in the project.
+
+### Attack Scenario
+
+1. Attacker gains write access to `pnpm-lock.yaml` (pull request, compromised CI, compromised developer machine).
+2. Attacker modifies a single package's `resolution` in the lockfile from tarball to directory type with a path traversal: `{directory: ../../../../../../home/user/.ssh, type: directory}`.
+3. The lockfile's `packages:` entry key is changed from `pkg@1.0.0` to `pkg@file:../../../../../../home/user/.ssh`, and the `importers` version reference is updated to match.
+4. The `package.json` is changed from `"pkg": "1.0.0"` to `"pkg": "file:../../../../../../home/user/.ssh"` to match (making the change look like a local dependency reference).
+5. Victim runs `pnpm install`.
+6. The directory fetcher reads ALL files from the target directory (SSH keys, credentials, configs) into the CAFS store and hardlinks them into `node_modules/<package>/`.
+7. A postinstall script from any other package — or any project script — can read and exfiltrate the stolen files from `node_modules/`.
+
+### Proof of Concept
+
+```bash
+# Prerequisites: setup.sh must have been run (verdaccio on localhost:4873)
+bash autofyn_audit/exploits/vuln9_directory_traversal/exploit.sh
+# Expected: PASS -- secret_key.pem and credentials.json found in node_modules/dir-traversal-target/
+```
+
+The exploit creates a sensitive target directory at `/tmp/vuln9_secrets/` containing a fake PEM private key (`secret_key.pem`), fake AWS credentials (`credentials.json`), and a fake DB password (`internal_config.env`). It publishes a legitimate `dir-traversal-target@1.0.0` package to verdaccio, runs an initial install to generate a valid lockfile, then uses python3 to tamper the lockfile — changing the resolution from tarball type to directory type with a path traversal pointing at `/tmp/vuln9_secrets`. After clearing the store and re-running install, the sensitive files appear in `node_modules/dir-traversal-target/`, confirming arbitrary directory content theft.
+
+### Impact
+
+Arbitrary directory content theft. An attacker who can modify the lockfile can silently redirect a dependency resolution to read sensitive directories on the build machine. SSH keys, cloud credentials, database configs, and proprietary source code are all accessible. The attack is particularly dangerous in CI/CD environments where `pnpm install --frozen-lockfile` is used and the lockfile is trusted. Unlike VULN-6/7 (patch path traversal which writes/deletes files), this vulnerability READS files — it is a data exfiltration vector.
+
+### Remediation
+
+1. **Validate resolved directory path:** After resolving `resolution.directory`, check that the result is within the project or workspace root. Reject paths that escape via `!resolvedPath.startsWith(workspaceRoot)`.
+2. **Validate resolution type consistency:** When reading lockfile entries, verify that the resolution type is consistent with the dependency specifier (e.g., a semver specifier should not resolve to a directory type).
+3. **Warn on resolution type changes:** Emit a warning when a lockfile entry's resolution type differs from what the resolver would produce for the given specifier.
+
+---
+
 ## Conclusion
 
-All eight vulnerabilities are confirmed and independently reproducible against pnpm v11.2.2 at commit 976504f. VULN-1 is the most severe, as it silently undermines the supply chain trust model that `--frozen-lockfile` is meant to provide. VULN-2 and VULN-3 enable credential theft through common supply chain attack patterns. VULN-4 demonstrates a defense-in-depth gap where pnpm delegates all protocol validation to git rather than validating lockfile inputs itself. VULN-5 reveals that the `allowBuilds` security policy is incomplete: it blocks lifecycle scripts but allows bin entries to be linked, enabling PATH hijacking from a package the operator believed was fully contained. VULN-6 and VULN-7 expose the patch application pipeline as a path traversal vector: a malicious `.patch` file committed to a project can write to or delete arbitrary files on the filesystem during `pnpm install`, with no path validation anywhere in the pipeline. VULN-8 demonstrates that pnpm's lifecycle environment sanitization has a case-sensitivity gap: uppercase `NPM_CONFIG_*` variables pass through unfiltered, enabling npm config injection in any environment where an attacker can set process-level environment variables.
+All nine vulnerabilities are confirmed and independently reproducible against pnpm v11.2.2 at commit 976504f. VULN-1 is the most severe, as it silently undermines the supply chain trust model that `--frozen-lockfile` is meant to provide. VULN-2 and VULN-3 enable credential theft through common supply chain attack patterns. VULN-4 demonstrates a defense-in-depth gap where pnpm delegates all protocol validation to git rather than validating lockfile inputs itself. VULN-5 reveals that the `allowBuilds` security policy is incomplete: it blocks lifecycle scripts but allows bin entries to be linked, enabling PATH hijacking from a package the operator believed was fully contained. VULN-6 and VULN-7 expose the patch application pipeline as a path traversal vector: a malicious `.patch` file committed to a project can write to or delete arbitrary files on the filesystem during `pnpm install`, with no path validation anywhere in the pipeline. VULN-8 demonstrates that pnpm's lifecycle environment sanitization has a case-sensitivity gap: uppercase `NPM_CONFIG_*` variables pass through unfiltered, enabling npm config injection in any environment where an attacker can set process-level environment variables. VULN-9 demonstrates that the directory fetcher resolves `resolution.directory` from the lockfile without any bounds check, allowing an attacker who can modify the lockfile to redirect a package resolution to an arbitrary directory on the filesystem, reading all files in that directory into the content-addressable store and hardlinking them into `node_modules/`.
 
-Recommended remediation priority: VULN-1 > VULN-6 > VULN-7 > VULN-4 > VULN-5 > VULN-2 > VULN-3 > VULN-8.
+Recommended remediation priority: VULN-1 > VULN-6 > VULN-7 > VULN-9 > VULN-4 > VULN-5 > VULN-2 > VULN-3 > VULN-8.
