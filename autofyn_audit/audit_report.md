@@ -10,7 +10,7 @@
 
 ## Executive Summary
 
-This audit identified seven independently reproducible security vulnerabilities in pnpm v11.2.2. All seven vulnerabilities have been confirmed with live proof-of-concept exploit scripts against the source-built binary at commit 976504f.
+This audit identified eight independently reproducible security vulnerabilities in pnpm v11.2.2. All eight vulnerabilities have been confirmed with live proof-of-concept exploit scripts against the source-built binary at commit 976504f.
 
 | ID | Title | Severity | CVSS v3.1 |
 |----|-------|----------|-----------|
@@ -21,8 +21,9 @@ This audit identified seven independently reproducible security vulnerabilities 
 | VULN-5 | Bin Linking Bypasses allowBuild Security Policy (PATH Hijacking) | Medium | 6.3 |
 | VULN-6 | Arbitrary File Write via Malicious Patch File (Path Traversal) | High | 7.3 |
 | VULN-7 | Arbitrary File Deletion via Malicious Patch File (Path Traversal) | High | 7.3 |
+| VULN-8 | Lifecycle Script Env Sanitization Bypass via Case-Sensitive Filter | Medium | 5.3 |
 
-The most severe finding (VULN-1) enables silent supply chain compromise: an attacker who can modify a project's lockfile can cause `pnpm install --frozen-lockfile` to install tampered packages without any integrity error or warning. VULN-4 and VULN-5 further demonstrate that the lockfile and the `allowBuilds` security policy both lack validation that a determined attacker can exploit. VULN-6 and VULN-7 expose pnpm's patch application pipeline as a path traversal vector: malicious `.patch` files can write to or delete arbitrary files on the filesystem during `pnpm install`.
+The most severe finding (VULN-1) enables silent supply chain compromise: an attacker who can modify a project's lockfile can cause `pnpm install --frozen-lockfile` to install tampered packages without any integrity error or warning. VULN-4 and VULN-5 further demonstrate that the lockfile and the `allowBuilds` security policy both lack validation that a determined attacker can exploit. VULN-6 and VULN-7 expose pnpm's patch application pipeline as a path traversal vector: malicious `.patch` files can write to or delete arbitrary files on the filesystem during `pnpm install`. VULN-8 demonstrates that pnpm's lifecycle environment sanitization uses a case-sensitive regex, allowing uppercase `NPM_CONFIG_*` environment variables to pass through unfiltered into lifecycle scripts, enabling npm config injection in CI environments.
 
 ---
 
@@ -532,8 +533,75 @@ Same root cause as VULN-6; the same fixes apply:
 
 ---
 
+## VULN-8: Lifecycle Script Env Sanitization Bypass via Case-Sensitive Filter
+
+**Severity:** Medium
+**CVSS v3.1 Score:** 5.3 (AV:N/AC:H/PR:L/UI:N/S:U/C:H/I:N/A:N)
+**Proof of Concept:** `exploits/vuln8_env_config_bypass/exploit.sh`
+
+### Affected Code
+
+| File | Lines | Role |
+|------|-------|------|
+| `exec/lifecycle/node_modules/@pnpm/npm-lifecycle/index.js` | 358-362 | `makeEnv()` filters env with `/^npm_/` (case-sensitive), leaving uppercase vars unfiltered |
+
+### Description
+
+The `makeEnv()` function in the vendored `@pnpm/npm-lifecycle` package constructs the environment passed to lifecycle scripts during `pnpm install`. It iterates `process.env` and copies vars that do NOT match `/^npm_/` into the new env object:
+
+```javascript
+// exec/lifecycle/node_modules/@pnpm/npm-lifecycle/index.js:358-362
+for (const i in process.env) {
+  if (!i.match(/^npm_/) && (!i.match(/^PATH$/i) || i === PATH)) {
+    env[i] = process.env[i]
+  }
+}
+```
+
+The regex `/^npm_/` is case-sensitive. It correctly blocks `npm_config_registry`, `npm_package_name`, and similar lowercase vars — but it does not block `NPM_CONFIG_REGISTRY`, `NPM_CONFIG_CACHE`, or any other uppercase variant.
+
+npm's `@npmcli/config` reads environment variables case-insensitively using `/^npm_config_/i`. Inside a lifecycle script, any npm invocation (including the one that spawned the script itself via npm hooks) will read `NPM_CONFIG_REGISTRY` and treat it as a config override, redirecting registry operations to whatever value it holds. This means an attacker who can inject `NPM_CONFIG_REGISTRY` into the process environment (e.g., via a CI/CD pipeline variable, a compromised tool in the build chain, or a social-engineering PR that sets an env var) can redirect all npm activity inside lifecycle scripts to a malicious registry — even though pnpm's sanitization was supposed to prevent exactly this.
+
+### Attack Scenario
+
+1. A CI/CD pipeline has `NPM_CONFIG_REGISTRY=https://attacker.example.com/` set as an environment variable (injected via a PR, a compromised build step, or a misconfigured CI template).
+2. The project runs `pnpm install`, which invokes lifecycle scripts (postinstall hooks) for installed packages.
+3. pnpm's `makeEnv()` filters lowercase `npm_config_registry` but passes `NPM_CONFIG_REGISTRY` through unmodified.
+4. Inside a lifecycle script that calls `npm install`, `npm exec`, or any npm operation, npm reads `NPM_CONFIG_REGISTRY` (case-insensitive match) and uses the attacker's registry URL.
+5. The lifecycle script fetches packages from the attacker's registry, which can serve malicious content, log all requests (package enumeration), or capture authentication tokens from subsequent npm operations.
+
+### Proof of Concept
+
+```bash
+# Prerequisites: setup.sh must have been run (verdaccio on localhost:4873)
+bash autofyn_audit/exploits/vuln8_env_config_bypass/exploit.sh
+# Expected: PASS -- uppercase NPM_CONFIG_REGISTRY bypassed env sanitization filter
+```
+
+The exploit publishes `env-checker@1.0.0` with a postinstall script that reads `process.env.NPM_CONFIG_REGISTRY` (uppercase) and `process.env.npm_config_registry` (lowercase) and writes each to a marker file if set. The test project runs `pnpm install` with both env vars set to `http://evil-registry.example.com/` and `--registry http://localhost:4873` as a CLI flag (so pnpm's own resolution uses verdaccio). After install, the uppercase marker exists with the evil registry URL (bypassed), while the lowercase marker is absent or contains pnpm's own computed value (filtered correctly).
+
+### Impact
+
+npm config injection in lifecycle scripts. An attacker with control over even one environment variable can redirect all npm operations performed by lifecycle scripts to a malicious registry. Common npm config targets beyond registry include `NPM_CONFIG_CACHE` (redirect cache to an attacker-controlled path), `NPM_CONFIG_GLOBALCONFIG` (load a malicious global config), and `NPM_CONFIG_USERCONFIG` (load a malicious user config). This bypass is invisible to pnpm users who rely on env sanitization to protect their builds.
+
+### Remediation
+
+Change the case-sensitive regex `/^npm_/` to a case-insensitive regex `/^npm_/i` at line 359 of `exec/lifecycle/node_modules/@pnpm/npm-lifecycle/index.js`:
+
+```javascript
+// Before (vulnerable)
+if (!i.match(/^npm_/) && (!i.match(/^PATH$/i) || i === PATH)) {
+
+// After (fixed)
+if (!i.match(/^npm_/i) && (!i.match(/^PATH$/i) || i === PATH)) {
+```
+
+This ensures that `NPM_CONFIG_REGISTRY`, `NPM_PACKAGE_NAME`, and all other uppercase `npm_*` variants are filtered out of the lifecycle environment, consistent with the intended sanitization behavior.
+
+---
+
 ## Conclusion
 
-All seven vulnerabilities are confirmed and independently reproducible against pnpm v11.2.2 at commit 976504f. VULN-1 is the most severe, as it silently undermines the supply chain trust model that `--frozen-lockfile` is meant to provide. VULN-2 and VULN-3 enable credential theft through common supply chain attack patterns. VULN-4 demonstrates a defense-in-depth gap where pnpm delegates all protocol validation to git rather than validating lockfile inputs itself. VULN-5 reveals that the `allowBuilds` security policy is incomplete: it blocks lifecycle scripts but allows bin entries to be linked, enabling PATH hijacking from a package the operator believed was fully contained. VULN-6 and VULN-7 expose the patch application pipeline as a path traversal vector: a malicious `.patch` file committed to a project can write to or delete arbitrary files on the filesystem during `pnpm install`, with no path validation anywhere in the pipeline.
+All eight vulnerabilities are confirmed and independently reproducible against pnpm v11.2.2 at commit 976504f. VULN-1 is the most severe, as it silently undermines the supply chain trust model that `--frozen-lockfile` is meant to provide. VULN-2 and VULN-3 enable credential theft through common supply chain attack patterns. VULN-4 demonstrates a defense-in-depth gap where pnpm delegates all protocol validation to git rather than validating lockfile inputs itself. VULN-5 reveals that the `allowBuilds` security policy is incomplete: it blocks lifecycle scripts but allows bin entries to be linked, enabling PATH hijacking from a package the operator believed was fully contained. VULN-6 and VULN-7 expose the patch application pipeline as a path traversal vector: a malicious `.patch` file committed to a project can write to or delete arbitrary files on the filesystem during `pnpm install`, with no path validation anywhere in the pipeline. VULN-8 demonstrates that pnpm's lifecycle environment sanitization has a case-sensitivity gap: uppercase `NPM_CONFIG_*` variables pass through unfiltered, enabling npm config injection in any environment where an attacker can set process-level environment variables.
 
-Recommended remediation priority: VULN-1 > VULN-6 > VULN-7 > VULN-4 > VULN-5 > VULN-2 > VULN-3.
+Recommended remediation priority: VULN-1 > VULN-6 > VULN-7 > VULN-4 > VULN-5 > VULN-2 > VULN-3 > VULN-8.
