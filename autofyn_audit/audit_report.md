@@ -10,7 +10,7 @@
 
 ## Executive Summary
 
-This audit identified eleven independently reproducible security vulnerabilities in pnpm v11.2.2. All eleven vulnerabilities have been confirmed with live proof-of-concept exploit scripts against the source-built binary at commit 976504f.
+This audit identified eleven independently reproducible security vulnerabilities in pnpm v11.2.2. All eleven vulnerabilities have been confirmed with live proof-of-concept exploit scripts against the source-built binary at commit 976504f. In addition, two end-to-end exploit chains demonstrate how individual vulnerabilities combine for complete attack scenarios, turning theoretical code-path concerns into confirmed, undeniable real-world attacks.
 
 | ID | Title | Severity | CVSS v3.1 |
 |----|-------|----------|-----------|
@@ -815,8 +815,76 @@ Remote code execution as the user running `pnpm install`. Any project with a git
 
 ---
 
+## Exploit Chains
+
+The following chains combine independently confirmed vulnerabilities into end-to-end attack scenarios. Each chain demonstrates a complete attack from a single `pnpm install` to a critical outcome, leaving no room for "this is just a hypothetical code path" dismissal.
+
+---
+
+### CHAIN-1: Lockfile Poisoning → Credential Theft Pipeline
+
+**Vulnerabilities chained:** VULN-1 (Integrity Check Bypass) + VULN-9 (Directory Path Traversal)
+**Impact:** Complete credential theft — SSH private keys and cloud credentials exfiltrated to attacker server — from a single lockfile modification
+**PoC:** `exploits/chain1_lockfile_credential_theft/exploit.sh`
+
+#### Attack Narrative
+
+An attacker who can modify a project's `pnpm-lock.yaml` makes two changes, each individually a confirmed vulnerability:
+
+1. **VULN-9 — Directory traversal redirect:** The resolution for package `chain1-data` is changed from a registry tarball to a directory type with a path traversal: `{directory: ../../../../../../tmp/chain1_secrets, type: directory}`. The lockfile's `packages:` and `snapshots:` entry keys and the `importers:` version reference are updated to match. When pnpm installs, the directory fetcher at `directory-fetcher/src/index.ts:30` resolves `resolution.directory` against the project root without any bounds check, reads all files from the victim's secrets directory (`id_rsa`, `credentials.json`), and hardlinks them into `node_modules/chain1-data/`.
+
+2. **VULN-1 — Integrity removal on a tampered package:** The resolution for package `chain1-exfil` has its `integrity:` field stripped, leaving only the `tarball:` URL pointing at the registry. The attacker has meanwhile unpublished and republished `chain1-exfil@1.0.0` with a malicious `postinstall` script (`exfil.js`). With `integrity: undefined`, the worker at `worker/src/start.ts:190` skips hash verification and installs the tampered package silently.
+
+3. **Exfiltration:** The `postinstall` in the tampered `chain1-exfil` package uses `process.env.INIT_CWD` (set by pnpm to the project root for all lifecycle scripts) to locate `node_modules/chain1-data/` — which now contains the stolen secrets from step 1. It reads `id_rsa` and `credentials.json` and sends them via HTTP POST to an attacker-controlled capture server.
+
+The victim runs a single `pnpm install`. No error is shown. SSH keys and cloud credentials are exfiltrated silently. The attack is invisible to CI/CD monitoring because `pnpm install` exits with status 0.
+
+The project explicitly allowlists `chain1-exfil` in `allowBuilds` — a realistic scenario where a developer trusts a known dependency. This makes the chain realistic: the attacker does not need to bypass policy, only poison the lockfile.
+
+#### Component Vulnerabilities
+
+- **VULN-1** (Critical, 8.7): Tampered package installs without integrity check when the `integrity:` field is removed from the lockfile resolution.
+- **VULN-9** (High, 7.1): Directory fetcher resolves `resolution.directory` from the lockfile without bounds checking, reading arbitrary directories into `node_modules/`.
+
+#### Combined Impact
+
+**Critical.** A single lockfile commit (feasible via PR, compromised CI, or lockfile drift) achieves complete credential theft. The lockfile modification is subtle: changing `resolution:` entries looks superficially similar to normal version upgrades. Standard code review is unlikely to catch the traversal path or the missing `integrity:` field without specific security tooling.
+
+---
+
+### CHAIN-2: Patch File SSH Backdoor
+
+**Vulnerabilities chained:** VULN-7 (Arbitrary File Delete via Patch) + VULN-6 (Arbitrary File Write via Patch)
+**Impact:** Persistent unauthorized SSH access — victim's `authorized_keys` replaced with attacker's public key — from a single `pnpm install`
+**PoC:** `exploits/chain2_patch_ssh_backdoor/exploit.sh`
+
+#### Attack Narrative
+
+An attacker who can contribute a `.patch` file to a project creates a single patch file with **two diff blocks**. The patch is committed alongside a `pnpm-workspace.yaml` `patchedDependencies` entry. A single `pnpm install` permanently backdoors the developer's SSH access:
+
+1. **VULN-7 — Delete existing authorized_keys:** The first diff block uses `deleted file mode 100644` with a path that traverses out of the package directory using 10 `../` segments: `../../../../../../../../../../tmp/chain2_home/.ssh/authorized_keys`. The `executeEffects` function in `apply.js` calls `fs.unlinkSync(eff.path)` with this unsanitized path, deleting the victim's SSH `authorized_keys` file. The `// TODO: integrity checks` comment in the source confirms the authors were aware validation was absent.
+
+2. **VULN-6 — Write attacker's key:** The second diff block uses `new file mode 100644` targeting the same path. The `executeEffects` function calls `fs.ensureDirSync(dirname(eff.path))` then `fs.writeFileSync(eff.path, fileContents, { mode: eff.mode })` with the attacker's SSH public key as content. Since the patch parser processes effects in the order they appear (`forEach`), the deletion runs first, then the creation — resulting in a clean replacement.
+
+The victim runs `pnpm install` to pick up a dependency update. No error is shown. Their `authorized_keys` now contains only the attacker's key. The attacker can immediately SSH into the developer's machine or CI runner.
+
+The attack requires only the ability to contribute a `.patch` file and update `pnpm-workspace.yaml` — both are routine in open-source contribution workflows (pull requests). No special privileges are needed beyond write access to the repository.
+
+#### Component Vulnerabilities
+
+- **VULN-7** (High, 7.3): `fs.unlinkSync` is called with an unsanitized path from the patch `diff --git a/` header, enabling arbitrary file deletion.
+- **VULN-6** (High, 7.3): `fs.writeFileSync` is called with an unsanitized path from the patch `+++ b/` header, enabling arbitrary file write with attacker-controlled content.
+
+#### Combined Impact
+
+**Critical.** A single patch file contributed via PR achieves persistent SSH access to any machine that runs `pnpm install`. The patch file looks like a normal dependency fix — the traversal paths in `diff --git` headers are not commonly reviewed for security. After `pnpm install`, the attacker has persistent access to the developer machine and any CI/CD runners that installed the project, surviving reboots and re-deploys. Revocation requires the victim to notice the unauthorized key and manually rotate `authorized_keys`, which may not happen until a breach is detected.
+
+---
+
 ## Conclusion
 
 All eleven vulnerabilities are confirmed and independently reproducible against pnpm v11.2.2 at commit 976504f. VULN-1 is the most severe, as it silently undermines the supply chain trust model that `--frozen-lockfile` is meant to provide. VULN-2 and VULN-3 enable credential theft through common supply chain attack patterns. VULN-4 demonstrates a defense-in-depth gap where pnpm delegates all protocol validation to git rather than validating lockfile inputs itself. VULN-5 reveals that the `allowBuilds` security policy is incomplete: it blocks lifecycle scripts but allows bin entries to be linked, enabling PATH hijacking from a package the operator believed was fully contained. VULN-6 and VULN-7 expose the patch application pipeline as a path traversal vector: a malicious `.patch` file committed to a project can write to or delete arbitrary files on the filesystem during `pnpm install`, with no path validation anywhere in the pipeline. VULN-8 demonstrates that pnpm's lifecycle environment sanitization has a case-sensitivity gap: uppercase `NPM_CONFIG_*` variables pass through unfiltered, enabling npm config injection in any environment where an attacker can set process-level environment variables. VULN-9 demonstrates that the directory fetcher resolves `resolution.directory` from the lockfile without any bounds check, allowing an attacker who can modify the lockfile to redirect a package resolution to an arbitrary directory on the filesystem, reading all files in that directory into the content-addressable store and hardlinking them into `node_modules/`. VULN-10 is a parallel path traversal in the local tarball fetcher: `resolution.tarball` with a `file:` prefix is resolved without containment checks, allowing an attacker who tampers the lockfile to redirect a package installation to read any accessible `.tgz` file on disk. VULN-11 demonstrates that `resolution.commit` is passed to `git fetch` without a `--` separator, enabling `--upload-pack` argument injection that achieves code execution on the machine running `pnpm install` when the repo host is in `gitShallowHosts` — which by default includes `github.com`, `gitlab.com`, and `bitbucket.org`, covering the majority of real-world git dependencies.
+
+Beyond the individual vulnerabilities, two end-to-end exploit chains confirm that multiple findings are not isolated weaknesses but components of complete attack scenarios. CHAIN-1 combines VULN-1 and VULN-9 to achieve silent credential theft from a single lockfile modification: the directory traversal reads SSH keys and cloud credentials into `node_modules/`, and integrity bypass allows a tampered package's postinstall script to exfiltrate them to an attacker-controlled server — all in a single `pnpm install` with no error output. CHAIN-2 combines VULN-7 and VULN-6 to achieve persistent SSH backdoor access: a single malicious patch file deletes the victim's SSH `authorized_keys` and replaces it with the attacker's public key, granting permanent remote access to any machine that ran `pnpm install`. These chains demonstrate that individual vulnerabilities, even if individually assessed as "high" rather than "critical," compound into critical-severity attacks when chained. Defenders cannot triage them in isolation.
 
 Recommended remediation priority: VULN-1 > VULN-11 > VULN-6 > VULN-7 > VULN-9 > VULN-10 > VULN-4 > VULN-5 > VULN-2 > VULN-3 > VULN-8.
