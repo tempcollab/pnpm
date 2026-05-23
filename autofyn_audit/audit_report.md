@@ -26,13 +26,13 @@ All findings in this report are classified into one of the following evidence ti
 
 | ID | Title | Severity | CVSS v3.1 | CWE | Evidence Tier |
 |----|-------|----------|-----------|-----|---------------|
-| PNPM-001 | Integrity Check Bypass via Missing Lockfile Integrity Field | High | 7.5 | CWE-354 | Direct pnpm Exploit + Attacker Infrastructure |
+| PNPM-001 | Integrity Check Bypass via Missing Lockfile Integrity Field | High | 8.1 | CWE-354 | Direct pnpm Exploit + Attacker Infrastructure |
 | PNPM-002 | Bin Linking Bypasses allowBuild Security Policy (PATH Hijacking) | High | 7.1 | CWE-269 | Direct pnpm Exploit + Attacker Infrastructure |
 | PNPM-003 | Auth Token Leakage on HTTP Redirect (Same Host) | Medium | 5.9 | CWE-522 | Direct pnpm Exploit + Attacker Infrastructure |
-| PNPM-004 | Arbitrary File Write/Delete via Malicious Patch File (Path Traversal) | High | 7.1 | CWE-22 | Direct pnpm Exploit |
-| PNPM-005 | Git Fetch `--upload-pack` Argument Injection via `resolution.commit` | Medium | 5.5 | CWE-88 | Source-Confirmed / Partial Live |
+| PNPM-004 | Arbitrary File Write/Delete via Malicious Patch File (Path Traversal) | High | 7.3 | CWE-22 | Direct pnpm Exploit |
+| PNPM-005 | Git Fetch `--upload-pack` Argument Injection via `resolution.commit` | Medium | 6.4 | CWE-88 | Source-Confirmed / Partial Live |
 | PNPM-006 | Lockfile Resolution Path Traversal (Directory and Tarball Fetchers) | Medium | 4.5 | CWE-22 | Direct pnpm Exploit + Attacker Infrastructure |
-| PNPM-007 | Git ext:: Protocol Injection via Lockfile (Conditional RCE) | Low | 3.1 | CWE-20 | Source-Confirmed / Partial Live |
+| PNPM-007 | Git ext:: Protocol Injection via Lockfile (Conditional RCE) | Low | 2.6 | CWE-20 | Source-Confirmed / Partial Live |
 
 ---
 
@@ -71,7 +71,7 @@ CHAIN-1 PASS -- credentials exfiltrated via lockfile poisoning pipeline
 
 #### Component Vulnerabilities
 
-- **PNPM-001** (High, 7.5): Tampered package installs without integrity check when the `integrity:` field is removed from the lockfile resolution.
+- **PNPM-001** (High, 8.1): Tampered package installs without integrity check when the `integrity:` field is removed from the lockfile resolution.
 - **PNPM-006** (Medium, 4.5): Directory fetcher resolves `resolution.directory` from the lockfile without bounds checking, reading arbitrary directories into `node_modules/`.
 
 #### Combined Impact
@@ -103,7 +103,7 @@ CHAIN-2 PASS -- SSH authorized_keys replaced with attacker public key via patch 
 
 #### Component Vulnerabilities
 
-- **PNPM-004** (High, 7.1): Both the file deletion (`fs.unlinkSync`) and file creation (`fs.writeFileSync`) effects use unsanitized paths from patch `diff --git` headers, enabling arbitrary file write and delete via path traversal.
+- **PNPM-004** (High, 7.3): Both the file deletion (`fs.unlinkSync`) and file creation (`fs.writeFileSync`) effects use unsanitized paths from patch `diff --git` headers, enabling arbitrary file write and delete via path traversal.
 
 #### Combined Impact
 
@@ -151,7 +151,7 @@ Credential theft despite the developer following the recommended security practi
 
 ### PNPM-001: Integrity Check Bypass via Missing Lockfile Integrity Field
 
-**Severity:** High -- 7.5 (AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N)
+**Severity:** High -- 8.1 (AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N)
 **CWE:** CWE-354 (Improper Validation of Integrity Check Value)
 **Proof of Concept:** `exploits/vuln1_integrity_bypass/exploit.sh`
 
@@ -396,7 +396,7 @@ This ensures that any protocol change (HTTPS to HTTP) strips the auth header, ev
 
 ### PNPM-004: Arbitrary File Write/Delete via Malicious Patch File (Path Traversal)
 
-**Severity:** High -- 7.1 (AV:N/AC:L/PR:L/UI:R/S:U/C:N/I:H/A:H)
+**Severity:** High -- 7.3 (AV:N/AC:L/PR:L/UI:R/S:U/C:N/I:H/A:H)
 **CWE:** CWE-22 (Improper Limitation of a Pathname to a Restricted Directory)
 **Proof of Concept (write):** `exploits/vuln6_patch_traversal_write/exploit.sh`
 **Proof of Concept (delete):** `exploits/vuln7_patch_traversal_delete/exploit.sh`
@@ -499,7 +499,7 @@ Arbitrary file write and delete as the user running `pnpm install`. An attacker 
 
 ### PNPM-005: Git Fetch `--upload-pack` Argument Injection via `resolution.commit`
 
-**Severity:** Medium -- 5.5 (AV:N/AC:H/PR:L/UI:R/S:U/C:H/I:H/A:N)
+**Severity:** Medium -- 6.4 (AV:N/AC:H/PR:L/UI:R/S:U/C:H/I:H/A:N)
 **CWE:** CWE-88 (Improper Neutralization of Argument Delimiters in a Command)
 **Proof of Concept:** `exploits/vuln11_git_upload_pack_rce/exploit.sh`
 
@@ -675,7 +675,7 @@ Data exfiltration from the build machine. An attacker who can modify the lockfil
 
 ### PNPM-007: Git ext:: Protocol Injection via Lockfile (Conditional RCE)
 
-**Severity:** Low -- 3.1 (AV:N/AC:H/PR:L/UI:R/S:U/C:N/I:L/A:N)
+**Severity:** Low -- 2.6 (AV:N/AC:H/PR:L/UI:R/S:U/C:N/I:L/A:N)
 **CWE:** CWE-20 (Improper Input Validation)
 **Proof of Concept:** `exploits/vuln4_git_ext_rce/exploit.sh`
 
