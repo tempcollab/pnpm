@@ -1,0 +1,5 @@
+# Runtime artifacts from setup.sh
+.verdaccio/
+.verdaccio_pid
+.verdaccio_token
+.commit_hash
