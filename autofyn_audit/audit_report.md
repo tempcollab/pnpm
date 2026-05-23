@@ -6,7 +6,7 @@
 **Repository:** `pnpm`
 **Commit Reviewed:** `976504f`
 **Date:** 2026-05-22
-**Status:** 2 High Vulnerabilities Confirmed + 3 End-to-End Exploit Chains
+**Status:** 3 High Vulnerabilities Confirmed + 3 End-to-End Exploit Chains
 
 ---
 
@@ -27,7 +27,7 @@ All findings in this report are classified into one of the following evidence ti
 | ID | Title | Severity | CVSS v3.1 | CWE | Evidence Tier |
 |----|-------|----------|-----------|-----|---------------|
 | PNPM-001 | Integrity Check Bypass via Missing Lockfile Integrity Field | High | 7.5 | CWE-354 | Direct pnpm Exploit + Attacker Infrastructure |
-| PNPM-002 | Bin Linking Bypasses allowBuild Security Policy (PATH Hijacking) | Medium | 6.3 | CWE-269 | Direct pnpm Exploit + Attacker Infrastructure |
+| PNPM-002 | Bin Linking Bypasses allowBuild Security Policy (PATH Hijacking) | High | 7.1 | CWE-269 | Direct pnpm Exploit + Attacker Infrastructure |
 | PNPM-003 | Auth Token Leakage on HTTP Redirect (Same Host) | Medium | 5.9 | CWE-522 | Direct pnpm Exploit + Attacker Infrastructure |
 | PNPM-004 | Arbitrary File Write/Delete via Malicious Patch File (Path Traversal) | High | 7.1 | CWE-22 | Direct pnpm Exploit |
 | PNPM-005 | Git Fetch `--upload-pack` Argument Injection via `resolution.commit` | Medium | 5.5 | CWE-88 | Source-Confirmed / Partial Live |
@@ -136,7 +136,7 @@ CHAIN-3 PASS -- credentials stolen despite allowBuilds block via bin shadow + di
 
 #### Component Vulnerabilities
 
-- **PNPM-002** (Medium, 6.3): `linkBinsOfDependencies()` runs unconditionally before the `ignoreScripts` check. A blocked package's bin entries are still linked into its parent's PATH.
+- **PNPM-002** (High, 7.1): `linkBinsOfDependencies()` runs unconditionally before the `ignoreScripts` check. A blocked package's bin entries are still linked into its parent's PATH.
 - **PNPM-006** (Medium, 4.5): `directory-fetcher/src/index.ts:30` resolves `resolution.directory` from the lockfile via `path.resolve` with no containment check.
 
 #### Combined Impact
@@ -229,7 +229,7 @@ Supply chain compromise. Malicious code can be installed on developer machines a
 
 ### PNPM-002: Bin Linking Bypasses allowBuild Security Policy (PATH Hijacking)
 
-**Severity:** Medium -- 6.3 (AV:N/AC:L/PR:L/UI:N/S:U/C:L/I:H/A:N)
+**Severity:** High -- 7.1 (AV:N/AC:L/PR:L/UI:N/S:U/C:L/I:H/A:N)
 **CWE:** CWE-269 (Improper Privilege Management)
 **Proof of Concept:** `exploits/vuln5_bin_shadow/exploit.sh`
 
@@ -796,6 +796,7 @@ autofyn_audit/
 ├── run_all_exploits.sh
 ├── docs/
 │   ├── CVE-PNPM-001.md
+│   ├── CVE-PNPM-002.md
 │   └── CVE-PNPM-004.md
 └── exploits/
     ├── vuln1_integrity_bypass/
