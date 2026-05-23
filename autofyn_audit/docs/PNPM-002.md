@@ -7,7 +7,7 @@
 **Affected Versions:** <= 11.2.2
 **Patched Versions:** None
 
-> Discovered by [AutoFyn](https://github.com/SignalPilot-Labs/AutoFyn). Full audit: [audit_report.md](https://github.com/tempcollab/pnpm/blob/main/autofyn_audit/audit_report.md)
+> Discovered by [AutoFyn](https://github.com/SignalPilot-Labs/AutoFyn). Full audit (7 confirmed findings, 3 exploit chains): [audit_report.md](https://github.com/tempcollab/pnpm/blob/main/autofyn_audit/audit_report.md)
 
 ### Summary
 

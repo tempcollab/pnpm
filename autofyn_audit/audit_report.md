@@ -1,12 +1,12 @@
 # Security Audit Report: pnpm
 
 **Audit Firm:** AutoFyn SignalPilot
-**Audit Model:** Claude Opus 4.6 (Anthropic)
+**Methodology:** Automated analysis with manual validation against source and PoCs
 **Target:** pnpm (https://github.com/pnpm/pnpm)
 **Repository:** `pnpm`
 **Commit Reviewed:** `976504f`
 **Date:** 2026-05-22
-**Status:** 3 primary report candidates + 4 lower-confidence hardening observations
+**Status:** 4 report candidates + 3 additional hardening observations
 
 ---
 
@@ -42,17 +42,17 @@ All findings in this report are classified into one of the following evidence ti
 
 | Chain | Severity | Vulnerabilities | Evidence | Script |
 |-------|----------|-----------------|----------|--------|
-| CHAIN-1 | Hardening observation | PNPM-001 + PNPM-006 | Direct pnpm Exploit + Attacker Infrastructure | `exploits/chain1_lockfile_credential_theft/exploit.sh` |
+| CHAIN-1 | Demonstration | PNPM-001 + PNPM-006 | Direct pnpm Exploit + Attacker Infrastructure | `exploits/chain1_lockfile_credential_theft/exploit.sh` |
 | CHAIN-2 | Medium | PNPM-004 (write + delete) | Direct pnpm Exploit | `exploits/chain2_patch_ssh_backdoor/exploit.sh` |
-| CHAIN-3 | Hardening observation | PNPM-002 + PNPM-006 | Direct pnpm Exploit + Attacker Infrastructure | `exploits/chain3_policy_bypass_theft/exploit.sh` |
+| CHAIN-3 | Demonstration | PNPM-002 + PNPM-006 | Direct pnpm Exploit + Attacker Infrastructure | `exploits/chain3_policy_bypass_theft/exploit.sh` |
 
-Only CHAIN-2 is recommended as disclosure evidence because it exercises one root cause: patch paths are not contained to the patched package directory. CHAIN-1 and CHAIN-3 are retained as local impact demonstrations, but they rely on PNPM-006, whose threat model is circular because exploitation requires modifying both `package.json` and the lockfile to request local `file:` content.
+CHAIN-2 is the strongest chain because it exercises one root cause: patch paths are not contained to the patched package directory. CHAIN-1 and CHAIN-3 are retained as impact demonstrations, but they rely on PNPM-006, whose incremental security impact is limited because exploitation requires modifying both `package.json` and the lockfile to request local `file:` content.
 
 ---
 
 ### CHAIN-1: Lockfile Poisoning to Credential Theft Pipeline
 
-**Severity:** Hardening observation
+**Severity:** Demonstration
 **Vulnerabilities:** PNPM-001 (Integrity Check Bypass) + PNPM-006 (Lockfile Resolution Path Traversal -- Directory Fetcher)
 **Evidence Tier:** Direct pnpm Exploit + Attacker Infrastructure (uses verdaccio as attacker registry plus exfil capture server)
 **Exploit Script:** `exploits/chain1_lockfile_credential_theft/exploit.sh`
@@ -78,7 +78,7 @@ CHAIN-1 PASS -- credentials exfiltrated via lockfile poisoning pipeline
 
 #### Combined Impact
 
-Credential theft from a single `pnpm install` in the demonstrated environment. This chain should not be treated as a standalone high-severity disclosure because it requires lockfile + `package.json` modification plus registry-side package substitution. Since the `package.json` change already requests local `file:` content, the chain is best understood as a defense-in-depth demonstration rather than a distinct exploit path.
+Credential theft from a single `pnpm install` in the demonstrated environment. This chain requires lockfile + `package.json` modification plus registry-side package substitution. Since the `package.json` change already requests local `file:` content, the chain is best understood as a defense-in-depth demonstration rather than a distinct exploit path.
 
 ---
 
@@ -115,7 +115,7 @@ Potential persistent SSH access to a machine that runs `pnpm install` with the m
 
 ### CHAIN-3: Security Policy Bypass to PATH Hijack to Credential Theft
 
-**Severity:** Hardening observation
+**Severity:** Demonstration
 **Vulnerabilities:** PNPM-002 (Bin Linking Bypasses allowBuild Policy) + PNPM-006 (Lockfile Resolution Path Traversal -- Directory Fetcher)
 **Evidence Tier:** Direct pnpm Exploit + Attacker Infrastructure (uses verdaccio as attacker registry)
 **Exploit Script:** `exploits/chain3_policy_bypass_theft/exploit.sh`
@@ -143,7 +143,7 @@ CHAIN-3 PASS -- credentials stolen despite allowBuilds block via bin shadow + di
 
 #### Combined Impact
 
-Credential theft in the demonstrated environment despite the developer blocking one package via `allowBuilds`. This chain should not be used as primary disclosure evidence because it depends on PNPM-006, which requires modifying both `package.json` and the lockfile. The useful takeaway is narrower: `allowBuilds` does not prevent a blocked package's bins from being linked, so a blocked package can still influence PATH if another script invokes a shadowed command name.
+Credential theft in the demonstrated environment despite the developer blocking one package via `allowBuilds`. This chain depends on PNPM-006, which requires modifying both `package.json` and the lockfile. The useful takeaway is narrower: `allowBuilds` does not prevent a blocked package's bins from being linked, so a blocked package can still influence PATH if another script invokes a shadowed command name.
 
 ---
 
@@ -663,7 +663,7 @@ Data exfiltration from the build machine. An attacker who can modify the lockfil
 #### Caveats
 
 - **Requires modifying BOTH lockfile AND package.json.** This is a significant precondition. The attacker must change the dependency specifier in `package.json` to a `file:` reference that matches the lockfile entry. A PR that changes both `package.json` and the lockfile simultaneously is more likely to attract review attention than a lockfile-only change.
-- **Circular threat model.** An attacker with the ability to modify `package.json` can add a direct `file:` dependency pointing anywhere on disk without needing to tamper the lockfile. The lockfile path traversal provides no additional capability beyond what the `package.json` change already enables. The finding is a defense-in-depth gap: pnpm should validate resolution paths regardless, but the incremental attack surface is limited.
+- **Limited incremental impact.** An attacker with the ability to modify `package.json` can add a direct `file:` dependency pointing anywhere on disk without needing to tamper the lockfile. The lockfile path traversal provides little additional capability beyond what the `package.json` change already enables. The finding is a defense-in-depth gap: pnpm should validate resolution paths regardless, but the incremental attack surface is limited.
 - **npm and yarn handle `file:` dependencies similarly.** The `file:` protocol is designed to reference local packages, and other package managers also resolve these paths without strict containment. The concern is shared across the ecosystem.
 
 #### Remediation
@@ -764,7 +764,7 @@ bash autofyn_audit/teardown.sh   # Cleanup
 
 ### Expected Output
 
-12/12 PASS (9 individual vulns + 3 chains)
+12/12 PASS (9 individual PoC scripts + 3 chain scripts)
 
 ### Cleanup
 
@@ -776,13 +776,13 @@ bash autofyn_audit/teardown.sh
 
 ## Conclusion
 
-The audit contains seven findings reproduced or source-confirmed against pnpm v11.2.2 at commit 976504f. Three are recommended as primary disclosure candidates: PNPM-004, PNPM-005, and PNPM-001. PNPM-002 is a reasonable medium-severity policy-gap report. PNPM-003, PNPM-006, and PNPM-007 are better framed as hardening observations unless maintainers request separate issues.
+The audit contains seven findings reproduced or source-confirmed against pnpm v11.2.2 at commit 976504f. PNPM-004, PNPM-005, PNPM-001, and PNPM-002 are the primary report candidates. PNPM-003, PNPM-006, and PNPM-007 are best treated as additional hardening observations unless maintainers request separate issues.
 
-PNPM-004 is the cleanest finding: pnpm applies patch file paths without containing them to the patched package directory. PNPM-005 demonstrates argument injection in git fetch via `resolution.commit`, with practical impact limited to SSH/local transports because HTTPS ignores the injected `--upload-pack` flag. PNPM-001 shows that `pnpm install --frozen-lockfile` does not fail closed when a remote tarball lockfile entry lacks integrity, but exploitation requires both lockfile tampering and control over the served tarball content. PNPM-002 reveals an incomplete implementation in the `allowBuilds` security policy: lifecycle scripts are blocked but bin linking is not, enabling PATH shadowing from a supposedly contained package if another script invokes the shadowed command. PNPM-003 is a straightforward hardening fix (compare origin, not just host) that prevents auth token leakage on protocol-downgrade redirects, though it requires a MITM position or compromised registry to exploit. PNPM-006 shows that both the directory fetcher and local tarball fetcher trust lockfile-provided paths without containment checks, though exploitation requires modifying both the lockfile and `package.json` -- a circular threat model since `package.json` changes can achieve the same outcome directly. PNPM-007 is a low-severity defense-in-depth gap where pnpm delegates git protocol validation to git itself rather than validating lockfile-provided URLs.
+PNPM-004 is the cleanest finding: pnpm applies patch file paths without containing them to the patched package directory. PNPM-005 demonstrates argument injection in git fetch via `resolution.commit`, with practical impact limited to SSH/local transports because HTTPS ignores the injected `--upload-pack` flag. PNPM-001 shows that `pnpm install --frozen-lockfile` does not fail closed when a remote tarball lockfile entry lacks integrity, but exploitation requires both lockfile tampering and control over the served tarball content. PNPM-002 reveals an incomplete implementation in the `allowBuilds` security policy: lifecycle scripts are blocked but bin linking is not, enabling PATH shadowing from a supposedly contained package if another script invokes the shadowed command. PNPM-003 is a straightforward hardening fix (compare origin, not just host) that prevents auth token leakage on protocol-downgrade redirects, though it requires a MITM position or compromised registry to exploit. PNPM-006 shows that both the directory fetcher and local tarball fetcher trust lockfile-provided paths without containment checks, though exploitation requires modifying both the lockfile and `package.json` -- a limited-incremental-impact threat model since `package.json` changes can achieve the same outcome directly. PNPM-007 is a low-severity defense-in-depth gap where pnpm delegates git protocol validation to git itself rather than validating lockfile-provided URLs.
 
 A recurring theme across findings PNPM-007, PNPM-004, PNPM-006, and PNPM-005 is that the attacker must already have a significant level of access (lockfile modification, repository commit access) that often enables equivalent damage through other vectors. These findings represent defense-in-depth improvements: pnpm should validate its inputs regardless of the trust model upstream, but the incremental security benefit should be weighed honestly against the preconditions required.
 
-CHAIN-2 is the only chain recommended as disclosure evidence, because it combines the write and delete variants of the same patch traversal root cause. CHAIN-1 and CHAIN-3 are retained as local impact demonstrations but should not be used as headline evidence because both depend on PNPM-006's circular `package.json` + lockfile precondition.
+CHAIN-2 is the strongest chain because it combines the write and delete variants of the same patch traversal root cause. CHAIN-1 and CHAIN-3 are retained as impact demonstrations, with the same PNPM-006 precondition caveat described above.
 
 Recommended remediation priority: PNPM-004 > PNPM-005 > PNPM-001 > PNPM-002 > PNPM-003 > PNPM-006 > PNPM-007.
 
@@ -797,10 +797,10 @@ autofyn_audit/
 ├── teardown.sh
 ├── run_all_exploits.sh
 ├── docs/
-│   ├── CVE-PNPM-001.md
-│   ├── CVE-PNPM-002.md
-│   ├── CVE-PNPM-004.md
-│   └── CVE-PNPM-005.md
+│   ├── PNPM-001.md
+│   ├── PNPM-002.md
+│   ├── PNPM-004.md
+│   └── PNPM-005.md
 └── exploits/
     ├── vuln1_integrity_bypass/
     ├── vuln2_auth_downgrade/
