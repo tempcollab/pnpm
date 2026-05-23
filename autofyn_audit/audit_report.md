@@ -6,7 +6,7 @@
 **Repository:** `pnpm`
 **Commit Reviewed:** `976504f`
 **Date:** 2026-05-22
-**Status:** 3 High Vulnerabilities Confirmed + 3 End-to-End Exploit Chains
+**Status:** 3 primary report candidates + 4 lower-confidence hardening observations
 
 ---
 
@@ -26,8 +26,8 @@ All findings in this report are classified into one of the following evidence ti
 
 | ID | Title | Severity | CVSS v3.1 | CWE | Evidence Tier |
 |----|-------|----------|-----------|-----|---------------|
-| PNPM-001 | Integrity Check Bypass via Missing Lockfile Integrity Field | High | 8.1 | CWE-354 | Direct pnpm Exploit + Attacker Infrastructure |
-| PNPM-002 | Bin Linking Bypasses allowBuild Security Policy (PATH Hijacking) | High | 7.1 | CWE-269 | Direct pnpm Exploit + Attacker Infrastructure |
+| PNPM-001 | Integrity Check Bypass via Missing Lockfile Integrity Field | Medium | 6.8 | CWE-354 | Direct pnpm Exploit + Attacker Infrastructure |
+| PNPM-002 | Bin Linking Bypasses allowBuild Security Policy (PATH Hijacking) | Medium | 5.9 | CWE-269 | Direct pnpm Exploit + Attacker Infrastructure |
 | PNPM-003 | Auth Token Leakage on HTTP Redirect (Same Host) | Medium | 5.9 | CWE-522 | Direct pnpm Exploit + Attacker Infrastructure |
 | PNPM-004 | Arbitrary File Write/Delete via Malicious Patch File (Path Traversal) | High | 7.3 | CWE-22 | Direct pnpm Exploit |
 | PNPM-005 | Git Fetch `--upload-pack` Argument Injection via `resolution.commit` | Medium | 6.4 | CWE-88 | Source-Confirmed / Partial Live |
@@ -36,21 +36,23 @@ All findings in this report are classified into one of the following evidence ti
 
 ---
 
-## Exploit Chains
+## Exploit Chains and Impact Demonstrations
 
 ### Chain Evidence Matrix
 
 | Chain | Severity | Vulnerabilities | Evidence | Script |
 |-------|----------|-----------------|----------|--------|
-| CHAIN-1 | High | PNPM-001 + PNPM-006 | Direct pnpm Exploit + Attacker Infrastructure | `exploits/chain1_lockfile_credential_theft/exploit.sh` |
+| CHAIN-1 | Hardening observation | PNPM-001 + PNPM-006 | Direct pnpm Exploit + Attacker Infrastructure | `exploits/chain1_lockfile_credential_theft/exploit.sh` |
 | CHAIN-2 | Medium | PNPM-004 (write + delete) | Direct pnpm Exploit | `exploits/chain2_patch_ssh_backdoor/exploit.sh` |
-| CHAIN-3 | Medium | PNPM-002 + PNPM-006 | Direct pnpm Exploit + Attacker Infrastructure | `exploits/chain3_policy_bypass_theft/exploit.sh` |
+| CHAIN-3 | Hardening observation | PNPM-002 + PNPM-006 | Direct pnpm Exploit + Attacker Infrastructure | `exploits/chain3_policy_bypass_theft/exploit.sh` |
+
+Only CHAIN-2 is recommended as disclosure evidence because it exercises one root cause: patch paths are not contained to the patched package directory. CHAIN-1 and CHAIN-3 are retained as local impact demonstrations, but they rely on PNPM-006, whose threat model is circular because exploitation requires modifying both `package.json` and the lockfile to request local `file:` content.
 
 ---
 
 ### CHAIN-1: Lockfile Poisoning to Credential Theft Pipeline
 
-**Severity:** High
+**Severity:** Hardening observation
 **Vulnerabilities:** PNPM-001 (Integrity Check Bypass) + PNPM-006 (Lockfile Resolution Path Traversal -- Directory Fetcher)
 **Evidence Tier:** Direct pnpm Exploit + Attacker Infrastructure (uses verdaccio as attacker registry plus exfil capture server)
 **Exploit Script:** `exploits/chain1_lockfile_credential_theft/exploit.sh`
@@ -71,12 +73,12 @@ CHAIN-1 PASS -- credentials exfiltrated via lockfile poisoning pipeline
 
 #### Component Vulnerabilities
 
-- **PNPM-001** (High, 8.1): Tampered package installs without integrity check when the `integrity:` field is removed from the lockfile resolution.
+- **PNPM-001** (Medium, 6.8): Tampered package installs without integrity check when the `integrity:` field is removed from the lockfile resolution.
 - **PNPM-006** (Medium, 4.5): Directory fetcher resolves `resolution.directory` from the lockfile without bounds checking, reading arbitrary directories into `node_modules/`.
 
 #### Combined Impact
 
-Credential theft from a single `pnpm install`. The attack requires lockfile + `package.json` modification (feasible via PR or compromised CI) plus a registry-side package substitution. The lockfile modification is subtle: changing `resolution:` entries looks superficially similar to normal version changes. Standard code review may not catch the traversal path or the missing `integrity:` field without specific security tooling.
+Credential theft from a single `pnpm install` in the demonstrated environment. This chain should not be treated as a standalone high-severity disclosure because it requires lockfile + `package.json` modification plus registry-side package substitution. Since the `package.json` change already requests local `file:` content, the chain is best understood as a defense-in-depth demonstration rather than a distinct exploit path.
 
 ---
 
@@ -107,13 +109,13 @@ CHAIN-2 PASS -- SSH authorized_keys replaced with attacker public key via patch 
 
 #### Combined Impact
 
-Persistent SSH access to any machine that runs `pnpm install` with the malicious patch. The attack requires repository commit access to contribute the `.patch` file and modify `pnpm-workspace.yaml`. As noted in the PNPM-004 caveats, an attacker with commit access could achieve similar outcomes through other means (e.g., malicious postinstall scripts), so this chain demonstrates the path traversal gap rather than a uniquely enabled attack.
+Potential persistent SSH access to a machine that runs `pnpm install` with the malicious patch, if the target SSH path is writable by the installing user. The attack requires a malicious `.patch` file and `pnpm-workspace.yaml` change to be accepted into the project. This is the strongest chain in the report because both steps exercise the same missing containment check rather than combining unrelated weak preconditions.
 
 ---
 
 ### CHAIN-3: Security Policy Bypass to PATH Hijack to Credential Theft
 
-**Severity:** Medium
+**Severity:** Hardening observation
 **Vulnerabilities:** PNPM-002 (Bin Linking Bypasses allowBuild Policy) + PNPM-006 (Lockfile Resolution Path Traversal -- Directory Fetcher)
 **Evidence Tier:** Direct pnpm Exploit + Attacker Infrastructure (uses verdaccio as attacker registry)
 **Exploit Script:** `exploits/chain3_policy_bypass_theft/exploit.sh`
@@ -136,12 +138,12 @@ CHAIN-3 PASS -- credentials stolen despite allowBuilds block via bin shadow + di
 
 #### Component Vulnerabilities
 
-- **PNPM-002** (High, 7.1): `linkBinsOfDependencies()` runs unconditionally before the `ignoreScripts` check. A blocked package's bin entries are still linked into its parent's PATH.
+- **PNPM-002** (Medium, 5.9): `linkBinsOfDependencies()` runs unconditionally before the `ignoreScripts` check. A blocked package's bin entries are still linked into its parent's PATH.
 - **PNPM-006** (Medium, 4.5): `directory-fetcher/src/index.ts:30` resolves `resolution.directory` from the lockfile via `path.resolve` with no containment check.
 
 #### Combined Impact
 
-Credential theft despite the developer following the recommended security practice of blocking the suspicious package via `allowBuilds`. The attack requires lockfile + `package.json` control and relies on the `allowBuilds` policy gap (bin linking not gated by `ignoreScripts`) combined with the directory fetcher path traversal. The developer's explicit security decision creates a false sense of containment.
+Credential theft in the demonstrated environment despite the developer blocking one package via `allowBuilds`. This chain should not be used as primary disclosure evidence because it depends on PNPM-006, which requires modifying both `package.json` and the lockfile. The useful takeaway is narrower: `allowBuilds` does not prevent a blocked package's bins from being linked, so a blocked package can still influence PATH if another script invokes a shadowed command name.
 
 ---
 
@@ -151,7 +153,7 @@ Credential theft despite the developer following the recommended security practi
 
 ### PNPM-001: Integrity Check Bypass via Missing Lockfile Integrity Field
 
-**Severity:** High -- 8.1 (AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N)
+**Severity:** Medium -- 6.8 (AV:N/AC:H/PR:L/UI:N/S:U/C:H/I:H/A:N)
 **CWE:** CWE-354 (Improper Validation of Integrity Check Value)
 **Proof of Concept:** `exploits/vuln1_integrity_bypass/exploit.sh`
 
@@ -211,11 +213,11 @@ The exploit publishes a legitimate package, generates a lockfile, republishes a 
 
 #### Impact
 
-Supply chain compromise. Malicious code can be installed on developer machines and in CI/CD pipelines without any warning. The `--frozen-lockfile` flag, which users rely on for reproducible and trusted installs, provides no protection against this attack vector when the integrity field is missing. Downstream consumers of the project are also at risk if the compromised build artifacts are published or deployed.
+Supply chain compromise in environments where an attacker can both alter the lockfile and cause the referenced registry URL to serve altered package content. The `--frozen-lockfile` flag does not fail closed when the integrity field is missing, so the install can accept the tarball returned by the registry URL without comparing it to a lockfile-pinned hash.
 
 #### Caveats
 
-- **Precondition:** The attacker must be able to modify the lockfile AND serve a tampered tarball from the registry URL. Lockfile modification alone is not sufficient -- the tarball at the original URL must also differ from the original.
+- **Precondition:** The attacker must be able to modify the lockfile AND serve a tampered tarball from the registry URL. Lockfile modification alone is not sufficient -- the tarball at the referenced URL must also differ from the original.
 - **npm/yarn comparison:** npm's `npm ci` requires integrity fields to be present in `package-lock.json` and fails if they are missing. Yarn Berry also enforces integrity by default. pnpm's behavior of silently skipping verification when the field is absent is a pnpm-specific gap.
 
 #### Remediation
@@ -229,7 +231,7 @@ Supply chain compromise. Malicious code can be installed on developer machines a
 
 ### PNPM-002: Bin Linking Bypasses allowBuild Security Policy (PATH Hijacking)
 
-**Severity:** High -- 7.1 (AV:N/AC:L/PR:L/UI:N/S:U/C:L/I:H/A:N)
+**Severity:** Medium -- 5.9 (AV:N/AC:H/PR:L/UI:N/S:U/C:L/I:H/A:N)
 **CWE:** CWE-269 (Improper Privilege Management)
 **Proof of Concept:** `exploits/vuln5_bin_shadow/exploit.sh`
 
@@ -250,7 +252,7 @@ When a package is blocked by `allowBuilds: { pkg: false }` in `pnpm-workspace.ya
 1. **Per-package bin linking** (`during-install` line 176): `linkBinsOfDependencies()` is called unconditionally in `buildDependency` regardless of `ignoreScripts` -- it runs before the `ignoreScripts` check gates `runPostinstallHooks`.
 2. **Project-level bin linking** (`deps-installer` line 1651 and 1679): `linkAllBins()` and `linkBinsOfPackages()` iterate all dependency graph nodes and all direct deps without any `allowBuild` check.
 
-A malicious package can declare `bin` entries that shadow common system commands (`node`, `npm`, `git`, `curl`, `sh`). Even when explicitly blocked by security policy, these bins appear in PATH whenever any other package's lifecycle script runs (because `extendPath` prepends `node_modules/.bin` to PATH), or when the user runs `pnpm exec`, `pnpm run`, or any npm script.
+A malicious package can declare `bin` entries that shadow common system commands (`node`, `npm`, `git`, `curl`, `sh`). Even when explicitly blocked by security policy, these bins can appear in PATH for lifecycle or project script execution. The bin is only dangerous if some later script or user command invokes the shadowed command name.
 
 #### Vulnerable Code
 
@@ -277,7 +279,7 @@ const hasSideEffects = !opts.ignoreScripts && await runPostinstallHooks(...)
 2. Victim adds it as a dependency and explicitly blocks it via `allowBuilds: { attacker-pkg: false }` in `pnpm-workspace.yaml`, believing this prevents any code execution.
 3. `pnpm install` blocks the package's postinstall script -- the security policy appears to work.
 4. However, `node_modules/.bin/node` is silently linked to the attacker's `malicious.js`.
-5. Any project script or any allowed package's postinstall that invokes `node` executes the attacker's binary instead of the real Node.js.
+5. Any project script or allowed package lifecycle script that invokes the shadowed command name may execute the attacker's binary instead of the intended executable.
 
 #### Proof of Concept
 
@@ -291,7 +293,7 @@ The exploit publishes `evil-shadow@1.0.0` with `"bin": { "curl": "./evil.sh" }` 
 
 #### Impact
 
-PATH hijacking from a package that is supposedly blocked by security policy. Users and security tooling that rely on `allowBuilds` to sandbox a suspicious package have an incomplete picture -- the package can still shadow any command name it chooses, affecting all scripts in the project. This is a gap in the `allowBuilds` feature's coverage.
+PATH hijacking from a package that is supposedly blocked by security policy. Users and security tooling that rely on `allowBuilds` to sandbox a suspicious package have an incomplete picture: the package's lifecycle scripts are blocked, but its declared executables may still be linked and may execute if another script invokes the shadowed command. This is a gap in the `allowBuilds` feature's coverage.
 
 #### Caveats
 
@@ -433,13 +435,13 @@ case 'file creation': {
 }
 ```
 
-**File delete variant:** The same root cause applies to file deletion effects. A patch with `deleted file mode 100644` triggers the "file deletion" effect type. The `executeEffects` function calls `fs.unlinkSync(eff.path)` with the unsanitized path. The `// TODO: integrity checks` comment at `apply.js:20` confirms the authors were aware that validation was missing.
+**File delete variant:** The same root cause applies to file deletion effects. A patch with `deleted file mode 100644` triggers the "file deletion" effect type. The `executeEffects` function calls `fs.unlinkSync(eff.path)` with the unsanitized path. The `// TODO: integrity checks` comment at `apply.js:20` shows that content/path validation is not implemented in this branch.
 
 ```javascript
 // apply.js:13-22 (vulnerable -- file deletion effect)
 case 'file deletion': {
   const eff = effect
-  // TODO: integrity checks   <-- authors knew this was missing
+  // TODO: integrity checks
   if (!opts.dryRun) {
     fs.unlinkSync(eff.path)   // deletes arbitrary path without validation
   }
@@ -480,7 +482,7 @@ The exploit publishes a trivial package, runs an initial `pnpm install`, then ad
 
 #### Impact
 
-Arbitrary file write and delete as the user running `pnpm install`. An attacker can overwrite SSH keys, shell configuration files, CI/CD credentials, or any other file the process has write access to. The `--frozen-lockfile` flag provides no protection since the patch file path and `pnpm-workspace.yaml` are separate from the lockfile.
+Arbitrary file write and delete as the user running `pnpm install`, limited to paths writable by that user. An attacker can target SSH keys, shell configuration files, CI/CD files, or other writable files. The `--frozen-lockfile` flag provides no protection since the patch file path and `pnpm-workspace.yaml` are separate from the lockfile.
 
 #### Caveats
 
@@ -774,15 +776,15 @@ bash autofyn_audit/teardown.sh
 
 ## Conclusion
 
-All seven vulnerabilities are confirmed and independently reproducible against pnpm v11.2.2 at commit 976504f.
+The audit contains seven findings reproduced or source-confirmed against pnpm v11.2.2 at commit 976504f. Three are recommended as primary disclosure candidates: PNPM-004, PNPM-005, and PNPM-001. PNPM-002 is a reasonable medium-severity policy-gap report. PNPM-003, PNPM-006, and PNPM-007 are better framed as hardening observations unless maintainers request separate issues.
 
-PNPM-001 is the most actionable finding: it allows `pnpm install --frozen-lockfile` to silently install tampered packages when the lockfile integrity field is absent, a gap that npm's `npm ci` does not have. PNPM-003 is a straightforward code fix (compare origin, not just host) that prevents auth token leakage on protocol-downgrade redirects, though it requires a MITM position to exploit. PNPM-007 is a low-severity defense-in-depth gap where pnpm delegates all git protocol validation to git itself rather than validating lockfile-provided URLs. PNPM-002 reveals an incomplete implementation in the `allowBuilds` security policy: lifecycle scripts are blocked but bin linking is not, enabling PATH shadowing from a supposedly contained package. PNPM-004 exposes the patch application pipeline to path traversal, though the threat model is weakened by the fact that an attacker with commit access to contribute patch files can often achieve equivalent damage through other means. PNPM-006 shows that both the directory fetcher and local tarball fetcher trust lockfile-provided paths without containment checks, though exploitation requires modifying both the lockfile and `package.json` -- a circular threat model since `package.json` changes can achieve the same outcome directly. PNPM-005 demonstrates argument injection in git fetch via `resolution.commit`, but the practical impact is limited because HTTPS transport (the common case) ignores the injected `--upload-pack` flag.
+PNPM-004 is the cleanest finding: pnpm applies patch file paths without containing them to the patched package directory. PNPM-005 demonstrates argument injection in git fetch via `resolution.commit`, with practical impact limited to SSH/local transports because HTTPS ignores the injected `--upload-pack` flag. PNPM-001 shows that `pnpm install --frozen-lockfile` does not fail closed when a remote tarball lockfile entry lacks integrity, but exploitation requires both lockfile tampering and control over the served tarball content. PNPM-002 reveals an incomplete implementation in the `allowBuilds` security policy: lifecycle scripts are blocked but bin linking is not, enabling PATH shadowing from a supposedly contained package if another script invokes the shadowed command. PNPM-003 is a straightforward hardening fix (compare origin, not just host) that prevents auth token leakage on protocol-downgrade redirects, though it requires a MITM position or compromised registry to exploit. PNPM-006 shows that both the directory fetcher and local tarball fetcher trust lockfile-provided paths without containment checks, though exploitation requires modifying both the lockfile and `package.json` -- a circular threat model since `package.json` changes can achieve the same outcome directly. PNPM-007 is a low-severity defense-in-depth gap where pnpm delegates git protocol validation to git itself rather than validating lockfile-provided URLs.
 
 A recurring theme across findings PNPM-007, PNPM-004, PNPM-006, and PNPM-005 is that the attacker must already have a significant level of access (lockfile modification, repository commit access) that often enables equivalent damage through other vectors. These findings represent defense-in-depth improvements: pnpm should validate its inputs regardless of the trust model upstream, but the incremental security benefit should be weighed honestly against the preconditions required.
 
-Three exploit chains confirm that individual findings combine into multi-step attack scenarios. CHAIN-1 combines PNPM-001 and PNPM-006 for credential theft via lockfile poisoning. CHAIN-2 uses both variants of PNPM-004 (write and delete) to replace SSH authorized_keys via a malicious patch file. CHAIN-3 combines PNPM-002 and PNPM-006 to steal credentials despite an explicit `allowBuilds` block.
+CHAIN-2 is the only chain recommended as disclosure evidence, because it combines the write and delete variants of the same patch traversal root cause. CHAIN-1 and CHAIN-3 are retained as local impact demonstrations but should not be used as headline evidence because both depend on PNPM-006's circular `package.json` + lockfile precondition.
 
-Recommended remediation priority: PNPM-001 > PNPM-002 > PNPM-005 > PNPM-004 > PNPM-006 > PNPM-003 > PNPM-007.
+Recommended remediation priority: PNPM-004 > PNPM-005 > PNPM-001 > PNPM-002 > PNPM-003 > PNPM-006 > PNPM-007.
 
 ---
 
@@ -797,7 +799,8 @@ autofyn_audit/
 ├── docs/
 │   ├── CVE-PNPM-001.md
 │   ├── CVE-PNPM-002.md
-│   └── CVE-PNPM-004.md
+│   ├── CVE-PNPM-004.md
+│   └── CVE-PNPM-005.md
 └── exploits/
     ├── vuln1_integrity_bypass/
     ├── vuln2_auth_downgrade/
